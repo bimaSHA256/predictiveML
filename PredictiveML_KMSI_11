@@ -1,1 +1,2064 @@
+# Single-cell — Full Forecasting Pipeline (stabil, vintage-safe, AR-ready)
+!pip -q install lightgbm openpyxl statsmodels shap optuna
 
+import warnings; warnings.filterwarnings("ignore")
+import numpy as np, pandas as pd, matplotlib.pyplot as plt, os, re, copy as _copy, math, itertools
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+from math import sqrt
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import RobustScaler
+from sklearn.feature_selection import mutual_info_regression
+import lightgbm as lgb
+from statsmodels.tsa.seasonal import STL
+import shap, optuna
+
+plt.rcParams["figure.dpi"] = 120
+
+# ==========================================================
+#   ⚙️ FEATURE SWITCHES (patched: implement 6 perbaikan)
+# ==========================================================
+STRICT_MODE = True
+LEAKAGE_AUDIT_MODE = True
+
+DO_TUNE = True
+N_TUNE_TRIALS = 25
+USE_ADAPTIVE_STL = True                 # tetap True agar log [STL] tampil, tapi kandidat dikunci → stabil
+ADAPTIVE_STL_CANDIDATES = (12,)         # <<< stabilkan period (perbaikan #2)
+ENABLE_SIGNAL_AUDIT = True
+ENABLE_LAG_AUDIT = True
+ENABLE_DRIFT_AUDIT = True
+ENABLE_SHAP = True
+ENABLE_SHAP_STABILITY_FILTER = True
+TOPK_STABLE_FEATURES = 80
+
+USE_TARGET_AS_FEATURE = True            # <<< aktifkan AR lags (perbaikan #1)
+LAG_DEPTH = 6
+FORECAST_HORIZON = 12
+
+# ===== FUTURE CONTROL =====
+FUTURE_MODE = "AR"                      # konsisten pakai AR utk future (perbaikan #1)
+USE_TARGET_DIFF1 = False                # hindari zig-zag
+BIAS_CORR_WINDOW = 9
+CQR_WINDOW = 24
+DO_SEASONAL_BLEND = True
+BLEND_H0 = 0.25
+BLEND_HK = 0.40
+
+# === Availability lag map (dipakai BASE & STRICT) — perbaikan #5
+STRICT_AVAILABILITY_LAG_MAP = {
+    # rilis +1
+    "pmi": 1, "pmi_indonesia": 1, "pmi_china": 1, "pmi_india": 1, "pmi_japan": 1, "pmi_usa": 1,
+    "cpi": 1, "inflation": 1,
+    # FX & indeks harian
+    "usd_to_idr": 0, "dxy_index": 0, "jpy_to_idr": 0, "cny_to_idr": 0,
+    # rilis +1/+2
+    "trade_balance": 2, "reserve_asset": 2,
+    # produksi domestik ~ +1
+    "id_coal_prod": 1, "wood_production": 1, "coal_export": 1, "coal_import": 1,
+    # komoditas global
+    "wti_oil": 0, "cpo": 0, "coal_ici4200": 0, "coal_nex6000": 0, "coal_qhd4700": 0, "gold": 0, "nickel": 0, "copper": 0, "tin": 0,
+    "interest_rate": 0, "fed_rate": 0,
+}
+# ==========================================================
+#  📅 LEBARAN CALENDAR (2016–2029, Indonesia-ish)
+#  sumber: pendekatan tanggal 1 Syawal versi umum; nggak harus super presisi harian
+# ==========================================================
+LEBARAN_DATES = [
+    pd.Timestamp("2016-07-06"),
+    pd.Timestamp("2017-06-25"),
+    pd.Timestamp("2018-06-15"),
+    pd.Timestamp("2019-06-05"),
+    pd.Timestamp("2020-05-24"),
+    pd.Timestamp("2021-05-13"),
+    pd.Timestamp("2022-05-02"),
+    pd.Timestamp("2023-04-22"),
+    pd.Timestamp("2024-04-10"),
+    pd.Timestamp("2025-03-29"),
+    pd.Timestamp("2026-03-19"),
+    pd.Timestamp("2027-03-08"),
+    pd.Timestamp("2028-02-26"),
+    pd.Timestamp("2029-02-14"),
+]
+
+def add_lebaran_features(df: pd.DataFrame,
+                         lebaran_dates: list[pd.Timestamp],
+                         month_window: int = 2) -> pd.DataFrame:
+    """
+    Tambah fitur-fitur Lebaran ke df:
+    - lebaran_distance: jarak (hari) ke Lebaran terdekat
+    - lebaran_distance_norm: jarak dalam "bulan" (dibagi 30)
+    - lebaran_window_lead/lag: dummy ±N bulan dari Lebaran
+    - lebaran_month: 1 kalau bulan Lebaran
+    """
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"]).dt.to_period("M").dt.to_timestamp("M")
+
+    def _nearest_lebaran_distance(ts: pd.Timestamp) -> int:
+        return min(abs((ts - d).days) for d in lebaran_dates)
+
+    out["lebaran_distance"] = out["date"].apply(_nearest_lebaran_distance)
+    out["lebaran_distance_norm"] = out["lebaran_distance"] / 30.0
+
+    # dummy: bulan yang *persis* sama dengan bulan Lebaran
+    lebaran_yearmonth = {(d.year, d.month) for d in lebaran_dates}
+    out["lebaran_month"] = out["date"].apply(
+        lambda x: int((x.year, x.month) in lebaran_yearmonth)
+    )
+    # window ± N bulan dari Lebaran (lebih toleran)
+    # misal untuk N=2, M-2, M-1, M, M+1, M+2 = 1
+    def _in_window(ts: pd.Timestamp) -> int:
+        for d in lebaran_dates:
+            diff = (ts.to_period("M") - d.to_period("M")).n
+            if abs(diff) <= month_window:
+                return 1
+        return 0
+
+    out[f"lebaran_window_{month_window}m"] = out["date"].apply(_in_window)
+
+    # kadang demand naik di bulan sebelum Lebaran
+    # bikin khusus M-1 dan M-2
+    def _is_month_minus(ts: pd.Timestamp, minus: int) -> int:
+        for d in lebaran_dates:
+            diff = (ts.to_period("M") - d.to_period("M")).n
+            if diff == -minus:
+                return 1
+        return 0
+
+    out["lebaran_m1"] = out["date"].apply(lambda x: _is_month_minus(x, 1))
+    out["lebaran_m2"] = out["date"].apply(lambda x: _is_month_minus(x, 2))
+
+    return out
+
+# ==========================================================
+#   ⚙️ CONFIGURATION
+# ==========================================================
+@dataclass
+class Config:
+    file_path: str = "Predictors_Allr_20259_gd535.xlsx"
+    sheet_name: Optional[str] = None
+    date_col_guess: Optional[List[str]] = None
+    target_col: str = "Demand"
+
+    explicit_forecast_start: Optional[str] = None
+    explicit_forecast_end: Optional[str] = None
+
+    predictor_lags: List[int] = (0, 1, 2, 3, 6, 9, 12)
+    rolling_windows: List[int] = (3, 6)
+    max_lag: int = 6
+    max_roll: int = 6
+    add_volatility: bool = True
+    add_quarter_and_trend: bool = True
+    use_month_one_hot: bool = True
+    covid_dummy: bool = True
+    covid_start: str = "2020-03-01"
+    covid_end: str   = "2021-12-01"
+
+    # Momentum & YoY
+    use_momentum_diff1: bool = True
+    use_momentum_diff3: bool = True
+    use_yoy12: bool = True
+
+    # Event CSV (kolom: 'Date/Period', 'Event', 'Category')
+    event_csv_path: Optional[str] = "Kalender_Peristiwa_2016-2025__dengan_Kategori_.csv"
+
+    # Interactions
+    enable_libur_interactions: bool = True
+    enable_econ_interactions: bool = True
+
+    # STL (stabil: robust=True; period tetap 12 via ADAPTIVE_STL_CANDIDATES)
+    use_stl: bool = True
+    stl_period: int = 12
+    stl_fit_window: int = 36
+
+    # Train setup
+    scaler_type: str = "robust"
+    n_splits: int = 5
+    random_state: int = 42
+    rolling_train_months: Optional[int] = 48
+    use_time_decay: bool = True
+    time_decay_halflife_months: float = 9.0   # <<< perbaikan #5 (halflife lebih panjang)
+
+    # Objective/constraint
+    objective_type: str = "l2"
+    enable_monotone: bool = True
+    lgbm_params: Optional[Dict] = None
+
+    # Cleaning rules
+    drop_feat_missing_gt: float = 0.95
+    drop_near_constant_thresh: float = 1e-10
+
+    # Vintage masking
+    future_fill_pct_threshold: float = 50.0
+    key_predictors_to_forecast: Optional[List[str]] = None
+
+CFG = Config()
+
+# ==========================================================
+#   🔧 HELPERS
+# ==========================================================
+def _default_lgbm_params(cfg: Config) -> Dict:
+    if cfg.objective_type.lower() == "huber":
+        return dict(objective="huber", alpha=0.9,
+                    n_estimators=1200, learning_rate=0.045,
+                    subsample=0.85, colsample_bytree=0.70,
+                    reg_lambda=4.0, reg_alpha=0.4,
+                    max_depth=-1, num_leaves=64, min_child_samples=28,
+                    random_state=cfg.random_state, n_jobs=-1, verbosity=-1)
+    elif cfg.objective_type.lower() == "l2":
+        return dict(objective="regression",
+                    n_estimators=1200, learning_rate=0.045,
+                    subsample=0.9, colsample_bytree=0.70,
+                    reg_lambda=3.5, reg_alpha=0.2,
+                    max_depth=-1, num_leaves=96, min_child_samples=24,
+                    random_state=cfg.random_state, n_jobs=-1, verbosity=-1)
+    elif cfg.objective_type.lower() == "l3":
+        return dict(objective="regression",
+                    n_estimators=1000, learning_rate=0.05,
+                    subsample=0.8, colsample_bytree=0.70,
+                    reg_lambda=6.0, reg_alpha=1.0,
+                    max_depth=8, num_leaves=64, min_child_samples=20,
+                    random_state=cfg.random_state, n_jobs=-1, verbosity=-1)
+    elif cfg.objective_type.lower() == "l4":
+        return dict(objective="huber", alpha=0.9,
+                    n_estimators=2000, learning_rate=0.09,
+                    subsample=0.9, colsample_bytree=0.8,
+                    reg_lambda=2.0, reg_alpha=0.2,
+                    max_depth=-1, num_leaves=128, min_child_samples=16,
+                    random_state=cfg.random_state, n_jobs=-1, verbosity=-1)
+    else:  # "l1"
+        return dict(objective="regression_l1",
+                    n_estimators=1300, learning_rate=0.04,
+                    subsample=0.9, colsample_bytree=0.70,
+                    reg_lambda=4.0, reg_alpha=0.4,
+                    max_depth=-1, num_leaves=80, min_child_samples=28,
+                    random_state=cfg.random_state, n_jobs=-1, verbosity=-1)
+
+def _sanitize_columns(cols: List[str]) -> List[str]:
+    out = []
+    for c in cols:
+        cc = str(c).strip().lower()
+        cc = "".join([ch if ch.isalnum() else "_" for ch in cc])
+        while "__" in cc: cc = cc.replace("__","_")
+        out.append(cc)
+    return out
+
+def detect_date_col(cols: List[str]) -> str:
+    for c in cols:
+        if ("date" in c) or ("period" in c): return c
+    raise ValueError("Tidak menemukan kolom tanggal. Set CFG.date_col_guess.")
+
+# --- Availability lag (shared by BASE & STRICT) ---
+def _strict_apply_availability_lag(df_in: pd.DataFrame, lag_map: Dict[str, int], silent: bool=False) -> pd.DataFrame:
+    df_out = df_in.copy()
+    applied = []
+    cols = list(df_out.columns)
+    for pref, lag in lag_map.items():
+        if lag <= 0: continue
+        pref_l = str(pref).lower()
+        pat = re.compile(rf"^{re.escape(pref_l)}(_|$)")
+        for c in cols:
+            cl = c.lower()
+            if c in ('date','Demand'): continue
+            if any(tag in cl for tag in ['_lag', '_roll', '_rstd', '_diff', '_yoy', '_t0']):  # raw only
+                continue
+            if pat.match(cl):
+                df_out[c] = df_out[c].shift(lag)
+                applied.append((c, lag))
+    if (not silent) and applied:
+        bylag = {}
+        for c, l in applied: bylag[l] = bylag.get(l, 0) + 1
+        print(f"[STRICT] Availability lag applied per bulan: {bylag}")
+    elif (not silent):
+        print("[STRICT] No availability lag applied (periksa prefix peta).")
+    return df_out
+
+def winsorize_engineered(df_in: pd.DataFrame,
+                         hist_mask: pd.Series,
+                         patterns=("diff", "rstd"),
+                         q=(0.01, 0.99),
+                         min_count: int = 30) -> pd.DataFrame:
+    df = df_in.copy()
+    lo, hi = q
+    cols = [c for c in df.columns
+            if c.startswith("X_") and any(p in c for p in patterns)]
+    capped = []
+    for c in cols:
+        s = pd.to_numeric(df.loc[hist_mask, c], errors="coerce")
+        s = s[np.isfinite(s)]
+        if s.size < min_count:
+            continue
+        ql, qh = np.quantile(s, [lo, hi])
+        df[c] = np.clip(df[c], ql, qh)
+        capped.append((c, float(ql), float(qh)))
+    if capped:
+        print(f"[CLEAN] Winsorized {len(capped)} engineered features at "
+              f"{int(lo*100)}–{int(hi*100)}th pct based on history.")
+    return df
+# ==========================================================
+#   📅 EVENT PARSER
+# ==========================================================
+def _classify_event_text(text: str) -> str:
+    t = "" if pd.isna(text) else str(text).lower()
+    if any(k in t for k in [
+        "libur","holiday","public holiday","cuti bersama",
+        "idul","lebaran","ramadan","ramadhan","eid","natal","christmas",
+        "tahun baru","imlek","nyepi","wafat isa","maulid","isra","miraj","adha","fitri"
+    ]): return "ev_libur_panjang"
+    if any(k in t for k in [
+        "regulasi","regulation","policy","kebijakan","tarif","pajak",
+        "bea","pabean","ppn","pph","permen","pmk","perppu","kepmen","peraturan","kepdir"
+    ]): return "ev_regulasi"
+    if any(k in t for k in [
+        "shock","commodity","harga","crash","pandemi","covid","banjir","gempa",
+        "el nino","la nina","geopolitik","embargo","disrupsi","strike","lockdown"
+    ]): return "ev_shock"
+    return "other"
+
+def maybe_attach_events(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    print("[STEP] Attaching event calendar…")
+    event_cols = ["ev_libur_panjang","ev_regulasi","ev_shock"]
+    path = cfg.event_csv_path
+    if not path or not os.path.exists(path):
+        for c in event_cols:
+            if c not in df.columns: df[c] = 0.0
+
+        # tambahkan manual spike sederhana supaya 2025 tidak benar-benar buta
+        df = add_lebaran_features(df, LEBARAN_DATES, month_window=2)
+        # jadikan satu event sintetis
+        df["ev_manual_lebaran"] = df["lebaran_window_2m"].astype(float)
+        print(f"[INFO] Event CSV '{path}' tidak ditemukan; semua event=0, added ev_manual_lebaran from calendar.")
+        return df
+
+    ev = pd.read_csv(path)
+    ev.columns = _sanitize_columns(list(ev.columns))
+    date_col = next((c for c in ev.columns if ("date" in c) or ("period" in c)), None)
+    if date_col is None:
+        for c in event_cols:
+            if c not in df.columns: df[c] = 0.0
+        print("[WARN] Kolom tanggal event tidak ditemukan. Lewati merge (semua event=0).")
+        return df
+
+    ev[date_col] = pd.to_datetime(ev[date_col], errors="coerce")
+    ev = ev.dropna(subset=[date_col]).copy()
+    ev["ym"] = ev[date_col].dt.to_period("M")
+
+    txt_cols = [c for c in ev.columns if c in ("event","category")]
+    if not txt_cols:
+        txt_cols = [c for c in ev.columns if c not in (date_col,"ym")]
+    ev["_text"] = ev[txt_cols].astype(str).agg(" ".join, axis=1)
+    ev["_class"] = ev["_text"].apply(_classify_event_text)
+
+    piv = ev.groupby(["ym","_class"]).size().unstack(fill_value=0).reset_index()
+    piv["date"] = piv["ym"].dt.to_timestamp("M")
+    for c in event_cols:
+        if c not in piv.columns: piv[c] = 0
+    piv[event_cols] = piv[event_cols].astype(float)
+    piv = piv[["date"] + event_cols]
+
+    df = df.drop(columns=event_cols, errors='ignore')
+    df = df.merge(piv, on="date", how="left")
+    for c in event_cols:
+        if c not in df.columns: df[c] = 0.0
+    df[event_cols] = df[event_cols].fillna(0.0)
+    print("[INFO] Event attached — sum per kolom:", {c:int(df[c].sum()) for c in event_cols})
+    return df
+
+# ==========================================================
+#   📦 DATA LOADER
+# ==========================================================
+def load_data(cfg: Config) -> pd.DataFrame:
+    print("[STEP] Loading dataset…")
+    xls = pd.ExcelFile(cfg.file_path)
+    sheet = cfg.sheet_name if cfg.sheet_name else xls.sheet_names[0]
+    df = pd.read_excel(cfg.file_path, sheet_name=sheet)
+
+    raw_cols = list(df.columns)
+    new_cols = _sanitize_columns(raw_cols)
+    df = df.rename(columns={rc: nc for rc, nc in zip(raw_cols, new_cols)})
+
+    # Drop time-proxy 'Year & Month' (perbaikan #3)
+    ym_cols = [c for c in df.columns if re.fullmatch(r"year_+month", c or "")]
+    if ym_cols:
+        df = df.drop(columns=ym_cols)
+        print("[CLEAN] Dropped time-proxy column(s):", ym_cols)
+
+    date_col = None
+    if cfg.date_col_guess:
+        for c in [c.lower() for c in cfg.date_col_guess]:
+            if c in df.columns: date_col = c; break
+    if date_col is None: date_col = detect_date_col(df.columns.tolist())
+
+    tgt_san = _sanitize_columns([cfg.target_col])[0]
+    if tgt_san not in df.columns:
+        raise ValueError(f"Kolom target '{cfg.target_col}' tidak ditemukan.")
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df[date_col] = df[date_col].dt.to_period("M").dt.to_timestamp("M")
+    df = df.sort_values(by=date_col).reset_index(drop=True)
+    if date_col != "date": df = df.rename(columns={date_col:"date"})
+
+    if tgt_san != "demand": df = df.rename(columns={tgt_san:"demand"})
+    df["Demand"] = df["demand"]; df = df.drop(columns=["demand"])
+
+    df = maybe_attach_events(df, cfg)
+    print(f"[INFO] Dataset loaded: {df.shape[0]} rows × {df.shape[1]} columns")
+    return df
+
+# ==========================================================
+#   🕒 TIME FEATURES & STL
+# ==========================================================
+def add_time_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    df['month'] = df['date'].dt.month
+    df['month_sin'] = np.sin(2*np.pi*df['month']/12)
+    df['month_cos'] = np.cos(2*np.pi*df['month']/12)
+    m = df['date'].dt.month.values
+    for k in range(1, 4):
+        df[f'm_sin{k}'] = np.sin(2*np.pi*k*m/12)
+        df[f'm_cos{k}'] = np.cos(2*np.pi*k*m/12)
+    df['year'] = df['date'].dt.year
+    if cfg.add_quarter_and_trend:
+        df['quarter'] = ((df['month']-1)//3 + 1).astype(int)
+        df['trend_idx'] = np.arange(1, len(df)+1, dtype=float)
+    if cfg.covid_dummy:
+        s, e = pd.Timestamp(cfg.covid_start), pd.Timestamp(cfg.covid_end)
+        df['covid_dummy'] = ((df['date']>=s) & (df['date']<=e)).astype(int)
+    if cfg.use_month_one_hot:
+        for mm in range(1,13):
+            df[f'month_{mm}'] = (df['month']==mm).astype(int)
+    return df
+
+def _auto_seasonal_period(y: pd.Series, candidates=None) -> int:
+    if candidates is None:
+        candidates = ADAPTIVE_STL_CANDIDATES
+    yv = pd.Series(y).astype(float).interpolate(limit_direction='both').values
+    yv = yv - np.nanmean(yv)
+    best_p, best_sc = 12, -np.inf
+    for p in candidates:
+        if len(yv) < p * 3:
+            continue
+        ac = np.corrcoef(yv[:-p], yv[p:])[0, 1]
+        ac_pen = ac - 0.02 * (12 / p)
+        from statsmodels.tsa.stattools import pacf
+        pac = pacf(yv, nlags=p, method='yw_adjusted')
+        score = 0.7 * ac_pen + 0.3 * pac[min(p, len(pac)-1)]
+        if score > best_sc:
+            best_p, best_sc = p, score
+    print(f"[STL] Auto seasonal period selected: {best_p} (score={best_sc:.3f})")
+    return int(best_p)
+
+def stl_decompose(series: pd.Series, period: int = 12):
+    s = series.astype(float).interpolate(limit_direction='both')
+    if USE_ADAPTIVE_STL:
+        period = _auto_seasonal_period(s, ADAPTIVE_STL_CANDIDATES)
+    res = STL(s, period=period, robust=True, seasonal=7).fit()   # robust=True (stabil)
+    trend = pd.Series(res.trend, index=series.index)
+    seasonal = pd.Series(res.seasonal, index=series.index)
+    resid = pd.Series(s - trend - seasonal, index=series.index)
+    return trend, seasonal, resid
+
+def extend_seasonal(last_date: pd.Timestamp, months: int, seasonal_template: pd.Series):
+    idx_future = pd.date_range(last_date + pd.offsets.MonthEnd(1), periods=months, freq='M')
+    pattern = np.tile(seasonal_template.values, int(np.ceil(months/len(seasonal_template)))) if len(seasonal_template)>0 else np.zeros(months)
+    return pd.Series(pattern[:months], index=idx_future)
+
+def extrapolate_trend(dates: pd.DatetimeIndex, trend: pd.Series, months_forward: int, fit_window: int):
+    t = trend.dropna()
+    t = t.iloc[-min(len(t), fit_window):]
+    if t.empty:
+        return pd.Series(np.zeros(months_forward), index=pd.date_range(dates[-1]+pd.offsets.MonthEnd(1), periods=months_forward, freq='M'))
+    x = np.arange(len(t))
+    deg = 2 if len(t) > 60 else 1
+    coef = np.polyfit(x, t.values, deg)
+    x_future = np.arange(len(t), len(t) + months_forward)
+    y_future = np.polyval(coef, x_future)
+    idx_future = pd.date_range(dates[-1]+pd.offsets.MonthEnd(1), periods=months_forward, freq='M')
+    return pd.Series(y_future, index=idx_future)
+
+def scale_predictors(df, cfg, forecast_start):
+    df = df.copy()
+    raw_predictors = [c for c in df.columns if c not in ['date','Demand']]
+    hist_mask = df['date'] < forecast_start
+    valid_feats = [f for f in raw_predictors if df.loc[hist_mask, f].notna().any()]
+    scaler = RobustScaler()
+    scaler.fit(df.loc[hist_mask, valid_feats])
+    df_scaled = df.copy()
+    df_scaled.loc[:, valid_feats] = scaler.transform(df.loc[:, valid_feats])
+    print(f"[SCALE] Scaled {len(valid_feats)} predictors (vintage-safe).")
+    return df_scaled, raw_predictors
+
+def compute_metrics(y_true, y_pred, eps=10.0):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = sqrt(mean_squared_error(y_true, y_pred))
+    denom = np.maximum(np.abs(y_true), eps)  # floor untuk bulan kecil
+    mape = np.mean(np.abs((y_true - y_pred) / denom)) * 100.0
+    return {"MAE": float(mae), "RMSE": float(rmse), "MAPE%": float(mape)}
+
+def compute_metrics_extended(y_true, y_pred,
+                             big_cutoff: float = 15.0,
+                             eps_small: float = 10.0):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = sqrt(mean_squared_error(y_true, y_pred))
+    denom = np.maximum(np.abs(y_true), eps_small)
+    mape = np.mean(np.abs((y_true - y_pred) / denom)) * 100.0
+
+    mask_big = y_true >= big_cutoff
+    if mask_big.any():
+        mape_big = np.mean(
+            np.abs((y_true[mask_big] - y_pred[mask_big]) /
+                   np.maximum(np.abs(y_true[mask_big]), 1e-6))
+        ) * 100.0
+    else:
+        mape_big = np.nan
+
+    return {
+        "MAE": float(mae),
+        "RMSE": float(rmse),
+        "MAPE%": float(mape),
+        "MAPE_big%": float(mape_big),
+    }
+# ==========================================================
+#   🧱 BUILD TRAINING MATRIX + AUDITS + CV TRAINING
+# ==========================================================
+def build_training_matrix(df_raw: pd.DataFrame, cfg: Config, forecast_start: pd.Timestamp
+                          ) -> Tuple[pd.DataFrame, pd.Series, List[str], Dict]:
+    df_scaled, raw_predictors = scale_predictors(df_raw, cfg, forecast_start)
+    df_scaled = add_time_features(df_scaled, cfg)
+
+    # --- Dynamic Lebaran distance feature (days until / after Lebaran) ---
+    # --- Lebaran features (pakai kalender global 2016–2029) ---
+    df_scaled = add_lebaran_features(df_scaled, LEBARAN_DATES, month_window=2)
+
+    # --- Retail calendar enhancers (dummy kuat untuk retail sales) ---
+    m = df_scaled['date'].dt
+
+    # Quarter markers
+    df_scaled['eoq']  = ((m.month % 3) == 0).astype(int)   # end of quarter: Mar/Jun/Sep/Dec
+    df_scaled['soq']  = ((m.month % 3) == 1).astype(int)   # start of quarter: Jan/Apr/Jul/Oct
+    df_scaled['eoh1'] = (m.month == 6).astype(int)         # end of first half (Jun)
+    df_scaled["promo_qtr_close"] = ((m.month % 3) == 0).astype(int)     # Mar/Jun/Sep/Dec
+    df_scaled["promo_season_q1"]  = m.month.isin([1, 2, 3]).astype(int)  # High promo awal tahun
+    df_scaled["promo_high"]       = ((df_scaled["promo_qtr_close"] == 1) | (df_scaled["promo_season_q1"] == 1)).astype(int)
+
+    # Workdays proxy (approx): total days - weekend days
+    days_in_month = m.days_in_month
+    weekends_approx = ((days_in_month / 7) * 2.0).round().astype(int)
+    df_scaled['workdays'] = (days_in_month - weekends_approx).astype(int)
+
+    # Lebaran moving window (proxy: Maret–Mei tinggi)
+    df_scaled['lebaran_window'] = m.month.isin([3,4,5]).astype(int)
+
+    # Pastikan masuk feature set dasar waktu
+    for c in ['eoq','soq','eoh1','workdays','lebaran_window','promo_qtr_close']:
+        if c not in locals().get('base_time_cols', []):
+            # base_time_cols akan dibentuk di bawah, maka tambahkan nanti
+            pass
+
+    aux = {}
+    if cfg.use_stl:
+        ser = df_scaled.set_index('date')["Demand"]
+        trend, seasonal, resid = stl_decompose(ser, period=cfg.stl_period)
+        df_scaled['__stl_trend'] = df_scaled['date'].map(trend)
+        df_scaled['__stl_seasonal'] = df_scaled['date'].map(seasonal)
+        df_scaled['__stl_resid'] = df_scaled["Demand"] - df_scaled['__stl_trend'] - df_scaled['__stl_seasonal']
+        target_series = '__stl_resid'
+        aux['stl_trend'], aux['stl_seasonal'] = trend, seasonal
+        aux['stl_resid_series'] = df_scaled.set_index('date')['__stl_resid'].copy()
+    else:
+        target_series = "Demand"
+
+    for col in raw_predictors:
+        df_scaled[f"X_{col}_t0"] = df_scaled[col]
+        for L in cfg.predictor_lags:
+            if L==0: continue
+            df_scaled[f"X_{col}_lag{L}"] = df_scaled[col].shift(L)
+        for w in cfg.rolling_windows:
+            roll = df_scaled[col].rolling(window=w, min_periods=w)
+            df_scaled[f"X_{col}_roll{w}"] = roll.mean()
+            if cfg.add_volatility:
+                df_scaled[f"X_{col}_rstd{w}"] = roll.std(ddof=0)
+        if cfg.use_momentum_diff1:
+            df_scaled[f"X_{col}_diff1"] = df_scaled[col] - df_scaled[col].shift(1)
+        if cfg.use_momentum_diff3:
+            df_scaled[f"X_{col}_diff3"] = df_scaled[col] - df_scaled[col].shift(3)
+        if cfg.use_yoy12:
+            base = df_scaled[col].shift(12)
+            df_scaled[f"X_{col}_yoy12"] = np.where((base!=0)&(~pd.isna(base)), df_scaled[col]/base - 1.0, np.nan)
+
+  # --- Channel signals: tarik wholesale/deliveries/backlog ke retail (opsional; hanya jika ada kolomnya) ---
+    for col_src, lags in [
+        ('total_demand', [1, 3, 6]),
+        ('deliveries', [1, 2]),
+        ('backlog', [1, 2]),
+    ]:
+        if col_src in df_scaled.columns:
+            for L in lags:
+                df_scaled[f"X_{col_src}_lag{L}"] = df_scaled[col_src].shift(L)
+
+    key_feats = ["usd_to_idr", "coal_ici5500", "coal_nex6000", "trade_balance"]
+    for f in key_feats:
+        if f in df_scaled.columns:
+            df_scaled[f + "_lag1"] = df_scaled[f].shift(1)
+            df_scaled[f + "_lag2"] = df_scaled[f].shift(2)
+
+    if cfg.enable_libur_interactions and ('ev_libur_panjang' in raw_predictors):
+        if 'id_coal_prod' in raw_predictors:
+            df_scaled["X_inter_libur_x_id_coal_t0"] = df_scaled["ev_libur_panjang"] * df_scaled["id_coal_prod"]
+        if 'coal_nex6000' in raw_predictors:
+            df_scaled["X_inter_libur_x_coal_nex6000_t0"] = df_scaled["ev_libur_panjang"] * df_scaled["coal_nex6000"]
+        if 'usd_to_idr' in raw_predictors:
+            df_scaled["X_inter_libur_x_usd_to_idr_t0"] = df_scaled["ev_libur_panjang"] * df_scaled["usd_to_idr"]
+        if 'dxy_index' in raw_predictors:
+            df_scaled["X_inter_libur_x_dxy_index_t0"] = df_scaled["ev_libur_panjang"] * df_scaled["dxy_index"]
+    elif cfg.enable_libur_interactions:
+        print("[WARN] Interaction skipped — missing 'ev_libur_panjang'")
+
+    if cfg.enable_econ_interactions:
+        def _have(c): return c in raw_predictors
+        combos = []
+        if _have('usd_to_idr'):
+            for com in ['wti_oil','coal_nex6000','cpo','nickel','copper','gold']:
+                if _have(com): combos.append(('usd_to_idr', com))
+        if _have('dxy_index'):
+            for com in ['wti_oil','coal_nex6000','cpo']:
+                if _have(com): combos.append(('dxy_index', com))
+        for a,b in combos:
+            df_scaled[f"X_inter_{a}_x_{b}_t0"] = df_scaled[a] * df_scaled[b]
+
+    base_time_cols = ['month','month_sin','month_cos']
+    base_time_cols += ['eoq','soq','eoh1','workdays','lebaran_window','promo_qtr_close']
+    base_time_cols += ['lebaran_distance','lebaran_distance_norm',
+                       'lebaran_month','lebaran_window_2m','lebaran_m1','lebaran_m2']
+    if cfg.use_month_one_hot: base_time_cols += [f"month_{m}" for m in range(1,13)]
+    if cfg.add_quarter_and_trend: base_time_cols += ['quarter','trend_idx']
+    if cfg.covid_dummy: base_time_cols += ['covid_dummy']
+
+    feature_cols = [c for c in df_scaled.columns if c.startswith('X_') or c in base_time_cols]
+
+    if '__stl_resid' in df_scaled.columns:
+        df_scaled['stl_resid_lag1'] = df_scaled['__stl_resid'].shift(1)
+        df_scaled['stl_resid_lag2'] = df_scaled['__stl_resid'].shift(2)
+        for lag_col in ['stl_resid_lag1', 'stl_resid_lag2']:
+            if lag_col not in feature_cols:
+                feature_cols.append(lag_col)
+        print("[FEATURE] Added stl_resid_lag1, stl_resid_lag2 for residual memory.")
+
+    hist_mask = df_scaled['date'] < forecast_start
+    df_scaled = winsorize_engineered(df_scaled, hist_mask,
+                                    patterns=("diff", "rstd"),
+                                    q=(0.01, 0.99),
+                                    min_count=30)
+
+    train_mask = df_scaled[target_series].notna()
+    X = df_scaled.loc[train_mask, feature_cols].copy()
+    y = df_scaled.loc[train_mask, target_series].copy()
+
+    # --- Target lags (perbaikan #1)
+    if USE_TARGET_AS_FEATURE:
+        try:
+            df_scaled["X_target_lag1"]  = df_scaled["Demand"].shift(1)
+            df_scaled["X_target_lag3"]  = df_scaled["Demand"].shift(3)
+            df_scaled["X_target_lag6"]  = df_scaled["Demand"].shift(6)
+            df_scaled["X_target_lag12"] = df_scaled["Demand"].shift(12)
+            if USE_TARGET_DIFF1:
+                df_scaled["X_target_diff1"] = df_scaled["Demand"].diff(1)
+            req_cols = ["X_target_lag1", "X_target_lag3"]
+            df_scaled = df_scaled.dropna(subset=req_cols)
+
+            new_feats = ["X_target_lag1","X_target_lag3","X_target_lag6","X_target_lag12"]
+            if USE_TARGET_DIFF1: new_feats.append("X_target_diff1")
+            for c in new_feats:
+                if c not in feature_cols:
+                    feature_cols.append(c)
+
+            hist_mask = df_scaled['date'] < forecast_start
+            df_scaled = winsorize_engineered(df_scaled, hist_mask,
+                                            patterns=("diff", "rstd"),
+                                            q=(0.01, 0.99),
+                                            min_count=30)
+            train_mask = df_scaled[target_series].notna()
+            X = df_scaled.loc[train_mask, feature_cols].copy()
+            y = df_scaled.loc[train_mask, target_series].copy()
+            print(f"[FEATURE] Target lags aktif (lag1/3/6/12; diff1={USE_TARGET_DIFF1}).")
+        except Exception as e:
+            print(f"[WARN] Patch lag target gagal diterapkan: {e}")
+    else:
+        print("[FEATURE] Target lags dimatikan (long-term mode).")
+
+    dates_all = df_scaled.loc[train_mask, 'date']
+    train_time = dates_all < forecast_start
+    if CFG.rolling_train_months and CFG.rolling_train_months>0:
+        cutoff = forecast_start - pd.DateOffset(months=CFG.rolling_train_months)
+        mask_time = train_time & (dates_all >= cutoff)
+    else:
+        mask_time = train_time
+
+    miss_ratio = X.loc[mask_time].isna().mean()
+    keep = miss_ratio[miss_ratio <= CFG.drop_feat_missing_gt].index.tolist()
+    X = X[keep]; feature_cols = keep
+    var_series = X.loc[mask_time].var(axis=0, ddof=0)
+    keep2 = var_series[var_series > CFG.drop_near_constant_thresh].index.tolist()
+
+    PIN = ["X_target_lag1","X_target_lag3","X_target_lag6","X_target_lag12"]
+    if USE_TARGET_DIFF1: PIN.append("X_target_diff1")
+    pin_in = [f for f in PIN if f in X.columns]
+    feature_cols = sorted(set(keep2).union(pin_in))
+    X = X[feature_cols]
+    print("[FEAT] Pinned target lags retained:", pin_in)
+
+    aux['raw_predictors'] = raw_predictors
+    aux['feature_cols'] = feature_cols
+    aux['dates_all'] = dates_all
+    aux['y_demand_all'] = df_scaled.loc[train_mask, "Demand"]
+    aux['base_time_cols'] = base_time_cols
+    aux['target_series'] = target_series
+    aux['df_scaled'] = df_scaled
+
+    return X, y, feature_cols, aux
+
+# =========================== Audits =========================
+def _time_decay_weights(dates: pd.Series, cutoff: pd.Timestamp, halflife_months: float) -> np.ndarray:
+    delta_months = (cutoff.year - dates.dt.year)*12 + (cutoff.month - dates.dt.month)
+    delta_months = delta_months.clip(lower=0)
+    return np.power(0.5, delta_months.astype(float)/float(max(1e-6, halflife_months))).values
+
+def signal_strength_audit(df: pd.DataFrame, forecast_start: pd.Timestamp):
+    mask = df['date'] < forecast_start
+    tgt = df.loc[mask, 'Demand']
+    res = []
+    for c in df.columns:
+        if c in ('date','Demand'): continue
+        s = df.loc[mask, c]
+        if s.notna().sum() > 12 and tgt.notna().sum() > 12:
+            try:
+                cor = np.corrcoef(s.fillna(method='ffill').fillna(method='bfill')[-len(tgt):], tgt.fillna(method='ffill').fillna(method='bfill'))[0,1]
+            except Exception:
+                cor = np.nan
+            s_f = s.fillna(method='ffill').fillna(method='bfill')
+            t_f = tgt.fillna(method='ffill').fillna(method='bfill')
+            try:
+                mi = mutual_info_regression(s_f.values.reshape(-1, 1), t_f.values, discrete_features=False)[0]
+            except Exception:
+                mi = np.nan
+            res.append((c, cor, mi, s.isna().mean()))
+    out = pd.DataFrame(res, columns=['feature','corr','mutual_info','missing_ratio']).sort_values(['mutual_info','corr'], ascending=[False, False])
+    print("\n[SIGNAL] Top 20 predictors by MI & Corr")
+    print(out.head(20).to_string(index=False))
+    return out
+
+def lag_alignment_audit(df: pd.DataFrame, feature_list: List[str], max_lag=12):
+    print("\n[LAG AUDIT] Suggested lags by cross-correlation peaks:")
+    tgt = df['Demand']
+    recs = []
+    for f in feature_list[:80]:
+        if f in ('date','Demand'): continue
+        s = df[f]
+        if s.notna().sum() < 24 or tgt.notna().sum() < 24: continue
+        s = s.astype(float).interpolate().values
+        t = tgt.astype(float).interpolate().values
+        best_lag, best_val = 0, -1
+        for L in range(0, max_lag+1):
+            v = np.corrcoef(s[:-L] if L>0 else s, t[L:] if L>0 else t)[0,1] if len(t)>(L+1) else np.nan
+            if not np.isnan(v) and v>best_val:
+                best_val, best_lag = v, L
+        recs.append((f, best_lag, best_val))
+    tab = pd.DataFrame(recs, columns=['feature','best_lag','corr_at_best']).sort_values('corr_at_best', ascending=False)
+    print(tab.head(20).to_string(index=False))
+    return tab
+
+def _psi(a: np.ndarray, b: np.ndarray, bins=10) -> float:
+    a = a[~np.isnan(a)]; b = b[~np.isnan(b)]
+    if len(a)==0 or len(b)==0: return np.nan
+    qs = np.quantile(a, np.linspace(0,1,bins+1))
+    qs[0], qs[-1] = -np.inf, np.inf
+    ca,_ = np.histogram(a, bins=qs); cb,_ = np.histogram(b, bins=qs)
+    pa = ca / max(1, ca.sum()); pb = cb / max(1, cb.sum())
+    pa = np.where(pa==0, 1e-6, pa); pb = np.where(pb==0, 1e-6, pb)
+    return float(np.sum((pa - pb) * np.log(pa / pb)))
+
+def feature_drift_audit(df: pd.DataFrame, forecast_start: pd.Timestamp, window_recent=24):
+    mask_hist = df['date'] < forecast_start
+    end = df.loc[mask_hist, 'date'].max()
+    if pd.isna(end):
+        print("[DRIFT] Tidak ada data historis."); return pd.DataFrame()
+    start_recent = end - pd.DateOffset(months=window_recent-1)
+    A = df[(df['date']>= (df['date'].min())) & (df['date']< start_recent)]
+    B = df[(df['date']>= start_recent) & (df['date']<= end)]
+    res=[]
+    for c in df.columns:
+        if c in ('date','Demand'): continue
+        psi = _psi(A[c].astype(float).values, B[c].astype(float).values)
+        res.append((c, psi))
+    tab = pd.DataFrame(res, columns=['feature','psi']).sort_values('psi', ascending=False)
+    print("\n[DRIFT] Top 20 PSI (higher => bigger shift)")
+    print(tab.head(20).to_string(index=False))
+    return tab
+
+def _collect_fi(model, feat_names):
+    try:
+        booster = model.booster_
+        imp = booster.feature_importance(importance_type='gain')
+        names = booster.feature_name()
+        return pd.DataFrame({"feature": names, "gain": imp})
+    except Exception:
+        try:
+            imp = model.feature_importances_
+            return pd.DataFrame({"feature": feat_names, "gain": imp})
+        except Exception:
+            return pd.DataFrame(columns=["feature","gain"])
+
+# ---------------- TRAIN with CV (vintage-safe STL per-fold) ----------------
+def train_lgbm_with_cv(X: pd.DataFrame, y: pd.Series, cfg: Config,
+                       dates: Optional[pd.Series]=None,
+                       y_orig: Optional[pd.Series]=None,
+                       trend: Optional[pd.Series]=None,
+                       seasonal: Optional[pd.Series]=None,
+                       forecast_start: Optional[pd.Timestamp]=None
+                       ) -> Tuple[lgb.LGBMRegressor, dict]:
+    params = _default_lgbm_params(cfg) if cfg.lgbm_params is None else cfg.lgbm_params.copy()
+    tscv = TimeSeriesSplit(n_splits=cfg.n_splits)
+    fold_metrics, best_iters = [], []
+    fold_fi = []
+    use_recons = bool(cfg.use_stl and dates is not None and y_orig is not None)
+
+    for tr_idx, va_idx in tscv.split(X):
+        Xtr, Xva = X.iloc[tr_idx], X.iloc[va_idx]
+        ytr, yva = y.iloc[tr_idx], y.iloc[va_idx]
+
+        if use_recons:
+            tr_dates = pd.to_datetime(dates.iloc[tr_idx])
+            train_demand_series = pd.Series(y_orig.iloc[tr_idx].values, index=tr_dates)
+            t_fold, s_fold, r_fold = stl_decompose(train_demand_series, period=cfg.stl_period)
+            r_vals = r_fold.reindex(tr_dates).values
+            ytr_resid = pd.Series(r_vals, index=Xtr.index)
+
+            model = lgb.LGBMRegressor(**params)
+            sw = _time_decay_weights(dates.iloc[tr_idx], forecast_start, cfg.time_decay_halflife_months) \
+                 if (cfg.use_time_decay and dates is not None and forecast_start is not None) else None
+            model.fit(Xtr, ytr_resid,
+                      eval_set=[(Xva, y.iloc[va_idx])],
+                      eval_metric='l1',
+                      callbacks=[lgb.early_stopping(stopping_rounds=150, verbose=False)],
+                      sample_weight=sw)
+
+            pred_resid = model.predict(Xva)
+            va_dates = pd.to_datetime(dates.iloc[va_idx])
+
+            def get_trend_seas_for_dates(t_series, s_series, target_dates):
+                t_idx0 = t_series.index[0]
+                months_since = [(d.to_period('M') - t_idx0.to_period('M')).n for d in target_dates]
+                t_out, s_out = [], []
+                t_vals_train = t_series.values
+                x_train = np.arange(len(t_vals_train))
+                if len(t_vals_train) >= 2:
+                    coef = np.polyfit(x_train, t_vals_train, 1)
+                else:
+                    coef = np.polyfit([0,1], np.append(t_vals_train, t_vals_train[-1] if len(t_vals_train)>0 else 0.0), 1)
+                seas_template = s_series.dropna().values
+                if seas_template.size == 0:
+                    seas_template = np.array([0.0])
+                for ms in months_since:
+                    if 0 <= ms < len(t_vals_train):
+                        t_out.append(t_vals_train[int(ms)])
+                        s_out.append(seas_template[int(ms) % len(seas_template)])
+                    else:
+                        t_out.append(np.polyval(coef, ms))
+                        s_out.append(seas_template[int(ms) % len(seas_template)])
+                return np.array(t_out), np.array(s_out)
+
+            t_va, s_va = get_trend_seas_for_dates(t_fold, s_fold, va_dates)
+            pred_dem = pred_resid + t_va + s_va
+            true_dem = y_orig.iloc[va_idx].values
+            fm = compute_metrics(true_dem, pred_dem)
+        else:
+            model = lgb.LGBMRegressor(**params)
+            sw = _time_decay_weights(dates.iloc[tr_idx], forecast_start, cfg.time_decay_halflife_months) \
+                 if (cfg.use_time_decay and dates is not None and forecast_start is not None) else None
+            model.fit(Xtr, ytr,
+                      eval_set=[(Xva, yva)],
+                      eval_metric='l1',
+                      callbacks=[lgb.early_stopping(stopping_rounds=150, verbose=False)],
+                      sample_weight=sw)
+            pred_va = model.predict(Xva)
+            fm = compute_metrics(yva, pred_va)
+
+        best_iters.append(getattr(model, "best_iteration_", params.get("n_estimators", 1200)))
+        fold_metrics.append(fm)
+        fi_fold = _collect_fi(model, X.columns.tolist())
+        fi_fold["fold"] = len(fold_metrics)
+        fold_fi.append(fi_fold)
+
+    avg_best = int(np.nanmean(best_iters)) if best_iters else params.get("n_estimators", 1200)
+    params["n_estimators"] = max(avg_best, params.get("n_estimators", 1200)//2, 200)
+    final_sw = _time_decay_weights(dates, forecast_start, cfg.time_decay_halflife_months) \
+               if (cfg.use_time_decay and dates is not None and forecast_start is not None) else None
+    final_model = lgb.LGBMRegressor(**params).fit(X, y, sample_weight=final_sw)
+
+    if len(fold_metrics) == 0:
+        avg = {"MAE": float('nan'), "RMSE": float('nan'), "MAPE%": float('nan')}
+    else:
+        keys = list(fold_metrics[0].keys())
+        avg = {k: float(np.nanmean([fm.get(k, np.nan) for fm in fold_metrics])) for k in keys}
+
+    cv_report = {
+        "folds": fold_metrics,
+        "avg": avg,
+        "fold_feature_importance": pd.concat(fold_fi, ignore_index=True) if fold_fi else pd.DataFrame()
+    }
+    return final_model, cv_report
+
+# ---------- CV with GAP ----------
+class _TSSWithGap:
+    def __init__(self, n_splits=5, gap=0, test_size=None):
+        self.n_splits=int(n_splits); self.gap=int(max(0, gap)); self.test_size=test_size
+    def split(self, X_like):
+        n=len(X_like); tsz = self.test_size or max(1, n//(self.n_splits+1))
+        for i in range(self.n_splits):
+            test_start = n - (self.n_splits - i)*tsz
+            test_end   = test_start + tsz
+            train_end  = max(0, test_start - self.gap)
+            yield np.arange(train_end), np.arange(test_start, test_end)
+
+def train_lgbm_with_cv_gap(X: pd.DataFrame, y: pd.Series, cfg: Config,
+                           dates: Optional[pd.Series]=None,
+                           y_orig: Optional[pd.Series]=None,
+                           trend: Optional[pd.Series]=None,
+                           seasonal: Optional[pd.Series]=None,
+                           forecast_start: Optional[pd.Timestamp]=None,
+                           gap: int = 0,
+                           test_size: int = 12,
+                           ) -> Tuple[lgb.LGBMRegressor, dict]:
+    params = _default_lgbm_params(cfg) if cfg.lgbm_params is None else cfg.lgbm_params.copy()
+    tss = _TSSWithGap(n_splits=cfg.n_splits, gap=max(0, int(gap)), test_size=int(test_size))
+    fold_metrics, best_iters = [], []
+    fold_fi = []
+    use_recons = bool(cfg.use_stl and dates is not None and y_orig is not None)
+
+    valid_fold_found = False
+    for tr_idx, va_idx in tss.split(X):
+        if len(tr_idx) == 0 or len(va_idx) == 0: continue
+        Xtr, Xva = X.iloc[tr_idx], X.iloc[va_idx]
+        ytr, yva = y.iloc[tr_idx], y.iloc[va_idx]
+
+        if use_recons:
+            tr_dates = pd.to_datetime(dates.iloc[tr_idx])
+            train_demand_series = pd.Series(y_orig.iloc[tr_idx].values, index=tr_dates)
+            t_fold, s_fold, r_fold = stl_decompose(train_demand_series, period=cfg.stl_period)
+            r_vals = r_fold.reindex(tr_dates).values
+            ytr_resid = pd.Series(r_vals, index=Xtr.index)
+
+            model = lgb.LGBMRegressor(**params)
+            sw = _time_decay_weights(dates.iloc[tr_idx], forecast_start, cfg.time_decay_halflife_months) \
+                 if (cfg.use_time_decay and dates is not None and forecast_start is not None) else None
+            model.fit(Xtr, ytr_resid,
+                      eval_set=[(Xva, y.iloc[va_idx])],
+                      eval_metric='l1',
+                      callbacks=[lgb.early_stopping(stopping_rounds=150, verbose=False)],
+                      sample_weight=sw)
+
+            pred_resid = model.predict(Xva)
+            va_dates = pd.to_datetime(dates.iloc[va_idx])
+
+            def get_trend_seas_for_dates(t_series, s_series, target_dates):
+                t_idx0 = t_series.index[0]
+                months_since = [(d.to_period('M') - t_idx0.to_period('M')).n for d in target_dates]
+                t_out, s_out = [], []
+                t_vals_train = t_series.values
+                x_train = np.arange(len(t_vals_train))
+                if len(t_vals_train) >= 2:
+                    coef = np.polyfit(x_train, t_vals_train, 1)
+                else:
+                    coef = np.polyfit([0,1], np.append(t_vals_train, t_vals_train[-1] if len(t_vals_train)>0 else 0.0), 1)
+                seas_template = s_series.dropna().values
+                if seas_template.size == 0: seas_template = np.array([0.0])
+                for ms in months_since:
+                    if 0 <= ms < len(t_vals_train):
+                        t_out.append(t_vals_train[int(ms)])
+                        s_out.append(seas_template[int(ms) % len(seas_template)])
+                    else:
+                        t_out.append(np.polyval(coef, ms))
+                        s_out.append(seas_template[int(ms) % len(seas_template)])
+                return np.array(t_out), np.array(s_out)
+
+            t_va, s_va = get_trend_seas_for_dates(t_fold, s_fold, va_dates)
+            pred_dem = pred_resid + t_va + s_va
+            true_dem = y_orig.iloc[va_idx].values
+            fm = compute_metrics(true_dem, pred_dem)
+        else:
+            model = lgb.LGBMRegressor(**params)
+            sw = _time_decay_weights(dates.iloc[tr_idx], forecast_start, cfg.time_decay_halflife_months) \
+                 if (cfg.use_time_decay and dates is not None and forecast_start is not None) else None
+            model.fit(Xtr, ytr,
+                      eval_set=[(Xva, yva)],
+                      eval_metric='l1',
+                      callbacks=[lgb.early_stopping(stopping_rounds=150, verbose=False)],
+                      sample_weight=sw)
+            pred_va = model.predict(Xva)
+            fm = compute_metrics(yva, pred_va)
+
+        valid_fold_found = True
+        best_iters.append(getattr(model, "best_iteration_", params.get("n_estimators", 1200)))
+        fold_metrics.append(fm)
+        fi_fold = _collect_fi(model, X.columns.tolist()); fi_fold["fold"] = len(fold_metrics)
+        fold_fi.append(fi_fold)
+
+    if not valid_fold_found:
+        print(f"[STRICT][WARN] Tidak ada fold CV valid (GAP={gap}). Fallback: fit penuh.")
+        final_model = lgb.LGBMRegressor(**params).fit(X, y)
+        cv_report = {"folds": [], "avg": {"MAE": float('nan'), "RMSE": float('nan'), "MAPE%": float('nan')}, "gap": int(gap), "fold_feature_importance": pd.DataFrame()}
+        return final_model, cv_report
+
+    avg_best = int(np.nanmean(best_iters)) if best_iters else params.get("n_estimators", 1200)
+    params["n_estimators"] = max(avg_best, params.get("n_estimators", 1200)//2, 200)
+    final_sw = _time_decay_weights(dates, forecast_start, cfg.time_decay_halflife_months) \
+               if (cfg.use_time_decay and dates is not None and forecast_start is not None) else None
+    final_model = lgb.LGBMRegressor(**params).fit(X, y, sample_weight=final_sw)
+
+    keys = list(fold_metrics[0].keys()) if len(fold_metrics)>0 else ["MAE","RMSE","MAPE%"]
+    avg = {k: float(np.nanmean([fm.get(k, np.nan) for fm in fold_metrics])) if len(fold_metrics)>0 else float('nan') for k in keys}
+    cv_report = {"folds": fold_metrics, "avg": avg, "gap": int(gap), "fold_feature_importance": pd.concat(fold_fi, ignore_index=True) if fold_fi else pd.DataFrame()}
+    return final_model, cv_report
+
+def train_quantile_model(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.Series,
+    forecast_start: pd.Timestamp,
+    alpha: float,
+    cfg: Config,
+) -> lgb.LGBMRegressor:
+    params = _default_lgbm_params(cfg).copy()
+    params.update({
+        "objective": "quantile",
+        "alpha": float(alpha),
+        "n_estimators": max(1500, params.get("n_estimators", 1200)),
+        "learning_rate": 0.035,
+        "subsample": 0.9,
+        "colsample_bytree": 0.8,
+        "num_leaves": min(128, params.get("num_leaves", 128)),
+        "min_child_samples": max(16, params.get("min_child_samples", 16)),
+        "verbosity": -1,
+        "random_state": cfg.random_state,
+        "n_jobs": -1,
+    })
+    sw = _time_decay_weights(dates, forecast_start, cfg.time_decay_halflife_months)
+    m = lgb.LGBMRegressor(**params)
+    m.fit(X, y, sample_weight=sw)
+    return m
+
+# ---------- SHAP stability selection (opsional) ----------
+df = load_data(CFG)
+
+# (perbaikan #5) APPLY AVAILABILITY LAG JUGA DI BASE — silent agar format log tetap rapi
+df = _strict_apply_availability_lag(df, STRICT_AVAILABILITY_LAG_MAP, silent=True)
+
+if getattr(CFG, "explicit_forecast_start", None):
+    forecast_start = pd.Timestamp(CFG.explicit_forecast_start)
+else:
+    last_actual_date = df.loc[df["Demand"].notna(), "date"].max()
+    forecast_start = last_actual_date + pd.offsets.MonthEnd(1)
+
+if ENABLE_SIGNAL_AUDIT:
+    sig_audit = signal_strength_audit(df, forecast_start)
+    top_feats = sig_audit.head(300)['feature'].tolist()
+
+    # (perbaikan #4) ALWAYS_KEEP: pin event & key macro agar tak tersapu reduksi
+    ALWAYS_KEEP = [
+        "ev_manual_lebaran",
+        "ev_libur_panjang","ev_regulasi","ev_shock",
+        "usd_to_idr","dxy_index","wti_oil",
+        "coal_nex6000","coal_ici5500","coal_qhd4700","coal_ici3800","coal_ici4200",
+        "nickel","cpo","gold","copper","tin",
+        "id_coal_prod","trade_balance","reserve_asset_mill_usd_","coal_import","coal_export","wood_production",
+        "lebaran_month","lebaran_window_2m","lebaran_m1","lebaran_m2",
+        "workdays","promo_qtr_close","promo_season_q1"
+    ]
+    ak = [c for c in ALWAYS_KEEP if c in df.columns]
+    # jaga urutan, unik
+    seen=set(); top_feats = [x for x in top_feats+ak if not (x in seen or seen.add(x))]
+    df = df[['date', 'Demand'] + [c for c in df.columns if c in top_feats]]
+    print(f"[REDUCE] Keeping top {len(top_feats)} features by signal strength.")
+
+if getattr(CFG, "explicit_forecast_end", None):
+    forecast_end = pd.Timestamp(CFG.explicit_forecast_end)
+else:
+    forecast_end = forecast_start + pd.DateOffset(months=FORECAST_HORIZON - 1)
+
+# Build training matrix
+X_train, y_train, feature_cols, aux = build_training_matrix(df, CFG, forecast_start)
+dates_train = aux['dates_all']
+y_demand_train = aux['y_demand_all']
+
+def _infer_feature_memory_from_cols(cols: List[str]) -> Tuple[int, int, bool]:
+    max_lag = 0; max_roll = 0; has_t0 = False
+    for c in cols:
+        cl = c.lower()
+        mlag = re.search(r"_lag(\d+)", cl)
+        if mlag: max_lag = max(max_lag, int(mlag.group(1)))
+        mroll = re.search(r"_roll(\d+)", cl)
+        if mroll: max_roll = max(max_roll, int(mroll.group(1)))
+        if "_t0" in cl: has_t0 = True
+    return max_lag, max_roll, has_t0
+
+_max_lag_b, _max_roll_b, _has_t0_b = _infer_feature_memory_from_cols(list(X_train.columns))
+_gap_base = int(max(_max_lag_b, max(0, _max_roll_b-1), 12))
+print(f"[BASE] Using CV GAP={_gap_base} (max_lag={_max_lag_b}, max_roll={_max_roll_b}, has_t0={_has_t0_b})")
+
+model, cv_report = train_lgbm_with_cv_gap(
+    X_train, y_train, CFG,
+    dates=dates_train, y_orig=y_demand_train,
+    trend=aux.get('stl_trend'),
+    seasonal=aux.get('stl_seasonal'),
+    forecast_start=forecast_start,
+    gap=_gap_base,
+    test_size=12
+)
+shap_per_fold = None
+selected_features = feature_cols.copy()
+if ENABLE_SHAP:
+    try:
+        explainer = shap.TreeExplainer(model)
+        keep_idx = (dates_train >= (forecast_start - pd.DateOffset(months=min(36, len(dates_train)))))
+        X_sub = X_train.loc[keep_idx, selected_features].fillna(0.0)
+        shap_vals = explainer.shap_values(X_sub)
+        if isinstance(shap_vals, list): shap_vals = shap_vals[0]
+        shap_abs_mean = np.nanmean(np.abs(shap_vals), axis=0)
+        shap_rank = pd.DataFrame({"feature": selected_features, "shap_abs_mean": shap_abs_mean}).sort_values("shap_abs_mean", ascending=False)
+        print("\n[SHAP] Top 20 features by |mean SHAP|:")
+        print(shap_rank.head(20).to_string(index=False))
+        if ENABLE_SHAP_STABILITY_FILTER:
+            fi_fold = cv_report.get("fold_feature_importance", pd.DataFrame())
+            if not fi_fold.empty:
+                g = (fi_fold.pivot_table(index="feature", columns="fold",
+                                        values="gain", aggfunc="mean").fillna(0.0))
+                g_mean = g.mean(axis=1).abs()
+                g_std  = g.std(axis=1)
+                fi_cv_series = pd.Series(
+                    np.where(g_mean < 1e-8, np.inf, g_std / g_mean),
+                    index=g.index
+                )
+                stab = fi_cv_series.to_dict()
+                shap_rank["fi_cv"] = shap_rank["feature"].map(stab)
+            else:
+                shap_rank["fi_cv"] = np.inf
+
+            shap_rank["fi_cv"] = shap_rank["fi_cv"].fillna(np.inf)
+            # Prioritas: SHAP besar, lalu CV kecil (lebih stabil)
+            shap_rank = shap_rank.sort_values(["shap_abs_mean", "fi_cv"],
+                                              ascending=[False, True])
+
+            topk = int(0.25 * len(shap_rank))
+            topk = max(50, min(topk, 400))
+            topk = min(TOPK_STABLE_FEATURES, len(shap_rank))
+            selected_features = shap_rank["feature"].head(topk).tolist()
+
+            FORCED = [
+                # target lags
+                "X_target_lag1","X_target_lag3","X_target_lag6","X_target_lag12","X_target_diff1",
+                # kalender yang penting ke 2025
+                "lebaran_month","lebaran_window_2m","lebaran_m1","lebaran_m2",
+                "workdays","promo_qtr_close","promo_season_q1"
+            ]
+            forced_in = [f for f in FORCED if f in X_train.columns]
+            selected_features = sorted(set(selected_features).union(forced_in))
+            print("[SHAP] Forced include target & calendar features:", forced_in)
+            print(f"[SHAP] Selected {len(selected_features)} stable features.")
+
+            model = lgb.LGBMRegressor(**(_default_lgbm_params(CFG) if CFG.lgbm_params is None else CFG.lgbm_params)).fit(
+                X_train[selected_features], y_train,
+                sample_weight=_time_decay_weights(dates_train, forecast_start, CFG.time_decay_halflife_months) if CFG.use_time_decay else None
+            )
+
+        shap_per_fold = shap_rank
+    except Exception as e:
+        print("[SHAP] Warning:", e)
+
+if 'selected_features' not in locals() or not selected_features:
+    selected_features = feature_cols.copy()
+selected_features = [f for f in selected_features if f in X_train.columns]
+missing_feats = [f for f in selected_features if f not in X_train.columns]
+if missing_feats:
+    print(f"[WARN] Removed {len(missing_feats)} missing features from selected_features:", missing_feats[:10])
+if len(selected_features) == 0:
+    selected_features = X_train.columns.tolist()
+    print("[WARN] selected_features kosong, fallback ke semua kolom X_train")
+
+model_p10 = train_quantile_model(
+    X_train[selected_features],
+    y_train,
+    dates_train,
+    forecast_start,
+    alpha=0.10,
+    cfg=CFG,
+)
+model_p90 = train_quantile_model(
+    X_train[selected_features],
+    y_train,
+    dates_train,
+    forecast_start,
+    alpha=0.90,
+    cfg=CFG,
+)
+
+# IMPORTANCE
+try:
+    booster = model.booster_
+    imp_all = pd.DataFrame({"feature": booster.feature_name(),
+                            "gain": booster.feature_importance(importance_type='gain')})
+except Exception:
+    imp_all = pd.DataFrame({"feature": selected_features, "gain": model.feature_importances_ if hasattr(model, "feature_importances_") else np.zeros(len(selected_features))})
+
+imp_x = imp_all[imp_all["feature"].str.startswith("X_")].copy()
+imp_x = imp_x[~imp_x["feature"].str.startswith("X_demand")]
+imp_x_sorted = imp_x.sort_values("gain", ascending=False)
+def _base_from_feature(f: str) -> str:
+    base = f[2:] if f.startswith('X_') else f
+    for tag in ("_lag","_roll","_rstd","_diff","_yoy","_t0"):
+        if tag in base: return base.split(tag)[0]
+    return base
+imp_x["group"] = imp_x["feature"].apply(_base_from_feature)
+imp_x = imp_x[imp_x["group"].str.lower() != "demand"]
+agg_by_group = (imp_x.groupby("group", as_index=False)["gain"].sum()
+                .sort_values("gain", ascending=False)
+                .assign(share_percent=lambda d: d["gain"]/d["gain"].sum()*100))
+
+def _featnames(model) -> List[str]:
+    try:
+        return list(model.booster_.feature_name())
+    except Exception:
+        try:
+            return list(getattr(model, "feature_names_in_", []))
+        except Exception:
+            return []
+
+# ---------- FORECASTS ----------
+def compute_single_row_features(df_scaled: pd.DataFrame,
+                                when: pd.Timestamp,
+                                cfg: Config,
+                                raw_predictors: List[str],
+                                base_time_cols: List[str]) -> pd.DataFrame:
+    d = df_scaled.copy().sort_values('date')
+    d = add_lebaran_features(d, LEBARAN_DATES, month_window=2)
+    for col in raw_predictors:
+        if col not in d.columns: d[col] = np.nan
+        d[f"X_{col}_t0"] = d[col]
+        for L in cfg.predictor_lags:
+            if L==0: continue
+            d[f"X_{col}_lag{L}"] = d[col].shift(L)
+        for w in cfg.rolling_windows:
+            roll = d[col].rolling(window=w, min_periods=w)
+            d[f"X_{col}_roll{w}"] = roll.mean()
+            if cfg.add_volatility:
+                d[f"X_{col}_rstd{w}"] = roll.std(ddof=0)
+        if cfg.use_momentum_diff1:
+            d[f"X_{col}_diff1"] = d[col] - d[col].shift(1)
+        if cfg.use_momentum_diff3:
+            d[f"X_{col}_diff3"] = d[col] - d[col].shift(3)
+        if cfg.use_yoy12:
+            base = d[col].shift(12)
+            d[f"X_{col}_yoy12"] = np.where((base!=0)&(~pd.isna(base)), d[col]/base - 1.0, np.nan)
+
+    d_time = d[['date']].copy()
+    d_time = add_time_features(d_time, cfg)
+
+    d["X_target_lag1"]  = d["Demand"].shift(1)
+    d["X_target_lag3"]  = d["Demand"].shift(3)
+    d["X_target_lag6"]  = d["Demand"].shift(6)
+    d["X_target_lag12"] = d["Demand"].shift(12)
+    if USE_TARGET_DIFF1:
+        d["X_target_diff1"] = d["Demand"].diff(1)
+
+    for c in base_time_cols:
+        if c not in d_time.columns:
+            d_time[c] = np.nan
+
+    feat_cols = [c for c in d.columns if c.startswith('X_')]
+    out = d[['date'] + feat_cols].merge(d_time[['date'] + base_time_cols], on='date', how='left')
+    out = out.set_index('date').sort_index()
+    if when not in out.index:
+        out.loc[when] = np.nan
+    return out.loc[[when]].reset_index(drop=True)
+
+def forecast_path(df_raw: pd.DataFrame,
+                  model: lgb.LGBMRegressor,
+                  model_lo: Optional[lgb.LGBMRegressor],
+                  model_hi: Optional[lgb.LGBMRegressor],
+                  cfg: Config,
+                  start_date: pd.Timestamp,
+                  end_date: pd.Timestamp,
+                  feature_cols: List[str],
+                  aux: Optional[Dict] = None) -> pd.DataFrame:
+
+    feat_mid = _featnames(model) or list(feature_cols)
+    feat_lo  = _featnames(model_lo) if model_lo is not None else []
+    feat_hi  = _featnames(model_hi) if model_hi is not None else []
+
+    df = df_raw.copy()
+    df_scaled, _ = scale_predictors(df, cfg, start_date)
+    df_scaled = df_scaled.drop_duplicates(subset=['date'], keep='last')
+    preds = []
+
+    trend = aux.get('stl_trend', None) if (aux and cfg.use_stl) else None
+    seasonal = aux.get('stl_seasonal', None) if (aux and cfg.use_stl) else None
+    idx_future = pd.date_range(start_date, end_date, freq='M')
+
+    resid_ser = aux.get('stl_resid_series', None) if aux else None
+    if resid_ser is not None and len(resid_ser.dropna())>=6:
+        resid_std_last = float(resid_ser.dropna().tail(12).std())
+    else:
+        tmp = (df_scaled['Demand'] - df_scaled['Demand'].shift(12)).abs()
+        resid_std_last = float(tmp.dropna().tail(12).std()) if tmp.notna().any() else 0.0
+    widen = 0.7
+
+    for when in idx_future:
+        feat_row = compute_single_row_features(
+            df_scaled, when, cfg, aux['raw_predictors'], aux['base_time_cols']
+        )
+        X_mid = feat_row.reindex(columns=feat_mid, fill_value=np.nan)
+        X_lo  = feat_row.reindex(columns=feat_lo,  fill_value=np.nan) if feat_lo else None
+        X_hi  = feat_row.reindex(columns=feat_hi,  fill_value=np.nan) if feat_hi else None
+
+        r_mid = float(model.predict(X_mid)[0])
+        r_lo  = float(model_lo.predict(X_lo)[0]) if (model_lo is not None and X_lo is not None and len(feat_lo)>0) else np.nan
+        r_hi  = float(model_hi.predict(X_hi)[0]) if (model_hi is not None and X_hi is not None and len(feat_hi)>0) else np.nan
+
+        t = float(trend.reindex([when]).fillna(method="ffill").fillna(method="bfill").values[0]) if trend is not None else 0.0
+        s = float(seasonal.reindex([when]).fillna(method="ffill").fillna(method="bfill").values[0]) if seasonal is not None else 0.0
+
+        yhat = r_mid + t + s
+        yhat_lo = r_lo + t + s if np.isfinite(r_lo) else yhat - resid_std_last*widen
+        yhat_hi = r_hi + t + s if np.isfinite(r_hi) else yhat + resid_std_last*widen
+
+        yhat_lo, yhat, yhat_hi = max(0, yhat_lo), max(0, yhat), max(0, yhat_hi)
+        if yhat_lo > yhat_hi:
+            yhat_lo, yhat_hi = yhat_hi, yhat
+
+        actual = df_scaled.loc[df_scaled['date']==when, 'Demand'].values
+        actual = actual[0] if len(actual)>0 else np.nan
+
+        preds.append({
+            "date": when,
+            "yhat": yhat,
+            "yhat_p10": yhat_lo,
+            "yhat_p90": yhat_hi,
+            "actual": actual
+        })
+
+    out = pd.DataFrame(preds)
+    out['source'] = 'forecast_direct'
+    print(f"[FORECAST] Direct forecast selesai: {len(out)} bulan dari {start_date:%Y-%m} sampai {end_date:%Y-%m}")
+    return out
+
+def _extend_trend_and_seasonal(trend_series, seasonal_series, last_hist_date, end_date):
+    if (trend_series is None) or (seasonal_series is None):
+        return trend_series, seasonal_series
+    if end_date > last_hist_date:
+        months_forward = (end_date.to_period("M") - last_hist_date.to_period("M")).n
+    else:
+        months_forward = 0
+    if months_forward > 0:
+        t_ext = extrapolate_trend(
+            dates=trend_series.index,
+            trend=trend_series,
+            months_forward=months_forward,
+            fit_window=CFG.stl_fit_window
+        )
+        trend_series = pd.concat([trend_series, t_ext])
+        seas_template = seasonal_series.dropna()
+        period_guess = 12 if len(seas_template) < 12 else 12
+        s_ext = extend_seasonal(last_hist_date, months_forward, seas_template.tail(period_guess))
+        seasonal_series = pd.concat([seasonal_series, s_ext])
+    return trend_series, seasonal_series
+
+def forecast_path_autoregressive(df_raw: pd.DataFrame,
+                                 model_mid: lgb.LGBMRegressor,
+                                 model_p10: Optional[lgb.LGBMRegressor],
+                                 model_p90: Optional[lgb.LGBMRegressor],
+                                 cfg: Config,
+                                 start_date: pd.Timestamp,
+                                 horizon: int,
+                                 lag_depth: int,
+                                 feature_cols: List[str],
+                                 aux: Optional[Dict]=None) -> pd.DataFrame:
+    feat_mid = _featnames(model_mid) or list(feature_cols)
+    feat_lo  = _featnames(model_p10) if model_p10 is not None else []
+    feat_hi  = _featnames(model_p90) if model_p90 is not None else []
+
+    df = df_raw.copy()
+    df_scaled, _ = scale_predictors(df, cfg, start_date)
+    df_scaled = df_scaled.drop_duplicates(subset=['date'], keep='last').sort_values('date')
+
+    trend = aux.get('stl_trend', None) if (aux and cfg.use_stl) else None
+    seasonal = aux.get('stl_seasonal', None) if (aux and cfg.use_stl) else None
+    resid_ser = aux.get('stl_resid_series', None)
+
+    last_hist_date = df_scaled['date'].max()
+    end_date = pd.date_range(start_date, periods=horizon, freq='M')[-1]
+    trend, seasonal = _extend_trend_and_seasonal(trend, seasonal, last_hist_date, end_date)
+
+    if resid_ser is not None and len(resid_ser.dropna())>=6:
+        resid_std_last = float(resid_ser.dropna().tail(12).std())
+    else:
+        tmp = (df_scaled['Demand'] - df_scaled['Demand'].shift(12)).abs()
+        resid_std_last = float(tmp.dropna().tail(12).std()) if tmp.notna().any() else 0.0
+    widen = 0.7
+
+    df_scaled["X_target_lag1"] = df_scaled["Demand"].shift(1)
+    df_scaled["X_target_lag3"] = df_scaled["Demand"].shift(3)
+    df_scaled["X_target_lag6"] = df_scaled["Demand"].shift(6)
+    df_scaled["X_target_lag12"] = df_scaled["Demand"].shift(12)
+    if USE_TARGET_DIFF1:
+       df_scaled["X_target_diff1"] = df_scaled["Demand"].diff(1)
+
+    preds = []
+    idx_future = pd.date_range(start_date, periods=horizon, freq='M')
+
+    for i, when in enumerate(idx_future, 1):
+        feat_row = compute_single_row_features(
+            df_scaled, when, cfg, aux['raw_predictors'], aux['base_time_cols']
+        )
+        X_mid = feat_row.reindex(columns=feat_mid, fill_value=np.nan)
+        X_lo  = feat_row.reindex(columns=feat_lo,  fill_value=np.nan) if feat_lo else None
+        X_hi  = feat_row.reindex(columns=feat_hi,  fill_value=np.nan) if feat_hi else None
+
+        r_mid = float(model_mid.predict(X_mid)[0])
+        t = float(trend.reindex([when]).fillna(method="ffill").fillna(method="bfill").values[0]) if trend is not None else 0.0
+        s = float(seasonal.reindex([when]).fillna(method="ffill").fillna(method="bfill").values[0]) if seasonal is not None else 0.0
+        yhat = r_mid + t + s
+
+        r_lo = float(model_p10.predict(X_lo)[0]) if (model_p10 is not None and X_lo is not None and len(feat_lo)>0) else np.nan
+        r_hi = float(model_p90.predict(X_hi)[0]) if (model_p90 is not None and X_hi is not None and len(feat_hi)>0) else np.nan
+        yhat_lo = r_lo + t + s if np.isfinite(r_lo) else yhat - resid_std_last*widen
+        yhat_hi = r_hi + t + s if np.isfinite(r_hi) else yhat + resid_std_last*widen
+        yhat_lo, yhat, yhat_hi = max(0, yhat_lo), max(0, yhat), max(0, yhat_hi)
+        if yhat_lo > yhat_hi:
+            yhat_lo, yhat_hi = yhat_hi, yhat
+
+        actual = df_scaled.loc[df_scaled['date']==when, 'Demand'].values
+        actual = float(actual[0]) if len(actual)>0 else np.nan
+        # cari Lebaran terdekat terhadap 'when'
+        nearest_lebaran = min(LEBARAN_DATES, key=lambda d: abs((when - d).days))
+        rel_month = (when.to_period("M") - nearest_lebaran.to_period("M")).n  # -2..+2
+
+        # ambil demand 12 bulan lalu sebagai baseline musiman
+        df_scaled = df_scaled.drop_duplicates(subset=["date"], keep="last")
+        hist_series = df_scaled.set_index("date")["Demand"]
+        try:
+            last_year_same_month = hist_series.shift(12).reindex([when]).iloc[0]
+        except Exception:
+            last_year_same_month = np.nan
+
+        if (not np.isnan(last_year_same_month)) and (-2 <= rel_month <= 2):
+            if rel_month == -2:
+                floor = 1.05 * last_year_same_month
+            elif rel_month == -1:
+                floor = 1.25 * last_year_same_month
+            elif rel_month == 0:
+                floor = 1.20 * last_year_same_month
+            elif rel_month == 1:
+                # sesudah Lebaran 2025 data kamu tinggi → boost lebih besar
+                floor = 1.60 * last_year_same_month
+            else:  # rel_month == 2
+                floor = 1.35 * last_year_same_month
+
+            # pakai nilai terbesar antara model dan floor
+            if yhat < floor:
+                yhat = floor
+                # sesuaikan band supaya gak di bawah point
+                yhat_lo = min(yhat_lo, yhat)
+                yhat_hi = max(yhat_hi, yhat)
+
+        preds.append({
+            "date": when,
+            "yhat": yhat,
+            "yhat_p10": yhat_lo,
+            "yhat_p90": yhat_hi,
+            "actual": actual
+        })
+
+        # update AR memory
+        df_scaled = pd.concat([df_scaled, pd.DataFrame([{"date": when, "Demand": yhat}])], ignore_index=True)
+        df_scaled = df_scaled.sort_values('date')
+        df_scaled["X_target_lag1"]  = df_scaled["Demand"].shift(1)
+        df_scaled["X_target_lag3"]  = df_scaled["Demand"].shift(3)
+        df_scaled["X_target_lag6"]  = df_scaled["Demand"].shift(6)
+        df_scaled["X_target_lag12"] = df_scaled["Demand"].shift(12)
+        if USE_TARGET_DIFF1:
+          df_scaled["X_target_diff1"] = df_scaled["Demand"].diff(1)
+
+    out = pd.DataFrame(preds)
+    out['source'] = 'forecast_autoregressive'
+    print(f"[FORECAST] Autoregressive forecast selesai: {len(out)} bulan.")
+    return out
+
+last_actual = df[df["Demand"].notna()]['date'].max()
+backcast_start = (last_actual - pd.DateOffset(months=24))
+backcast_end   = last_actual
+fcst_back = forecast_path(df, model, model_p10, model_p90, CFG,
+                          backcast_start, backcast_end, selected_features, aux=aux)
+mask_eval_back = fcst_back['actual'].notna()
+back_metrics = compute_metrics_extended(
+    fcst_back.loc[mask_eval_back,'actual'],
+    fcst_back.loc[mask_eval_back,'yhat'],
+    big_cutoff=15.0
+)
+# --- Split evaluation: Lebaran-ish vs normal ---
+back_eval = fcst_back.loc[mask_eval_back, ["date","actual","yhat"]].copy()
+back_eval["date"] = pd.to_datetime(back_eval["date"])
+
+def _is_lebaran_window(ts: pd.Timestamp, month_window: int = 2) -> bool:
+    for d in LEBARAN_DATES:
+        diff = (ts.to_period("M") - d.to_period("M")).n
+        if abs(diff) <= month_window:
+            return True
+    return False
+
+back_eval["is_lebaran_win"] = back_eval["date"].apply(_is_lebaran_window)
+
+be_l = back_eval[back_eval["is_lebaran_win"]]
+be_n = back_eval[~back_eval["is_lebaran_win"]]
+
+if not be_l.empty:
+    m_l = compute_metrics_extended(be_l["actual"], be_l["yhat"])
+    print("\n[DIAG] Backcast — Lebaran window :", {k: round(v,3) for k,v in m_l.items()})
+if not be_n.empty:
+    m_n = compute_metrics_extended(be_n["actual"], be_n["yhat"])
+    print("[DIAG] Backcast — Normal months  :", {k: round(v,3) for k,v in m_n.items()})
+
+if (FUTURE_MODE == "AR") and USE_TARGET_AS_FEATURE:
+    fcst_fwd = forecast_path_autoregressive(
+        df, model, model_p10, model_p90, CFG,
+        forecast_start, horizon=FORECAST_HORIZON,
+        lag_depth=LAG_DEPTH, feature_cols=selected_features, aux=aux
+    )
+else:
+    fcst_fwd = forecast_path(
+        df, model, model_p10, model_p90, CFG,
+        forecast_start, forecast_end, selected_features, aux=aux
+    )
+
+# === Bias correction (additive; log tetap sama)
+def _apply_bias_correction_flexible(fc_back: pd.DataFrame,
+                                    fc_fwd: pd.DataFrame,
+                                    win: int = 9) -> pd.DataFrame:
+    # pakai only rows that actually have actuals
+    b = fc_back.dropna(subset=["actual","yhat"]).copy()
+    if b.empty:
+        print("[POST] Bias correction skipped (no actual in backcast).")
+        return fc_fwd
+    b["err"] = b["actual"] - b["yhat"]
+    bias = b["err"].tail(max(3, min(win, len(b)))).mean()
+
+    out = fc_fwd.copy()
+    out["yhat"] = out["yhat"] + bias
+    if "yhat_p10" in out.columns:
+        out["yhat_p10"] = out["yhat_p10"] + bias
+    if "yhat_p90" in out.columns:
+        out["yhat_p90"] = out["yhat_p90"] + bias
+    print(f"[POST] Bias correction (flex) applied: {bias:.2f} on {len(b)} pts")
+    return out
+
+def _apply_bias_correction_smart(fc_back: pd.DataFrame,
+                                 fc_fwd: pd.DataFrame,
+                                 win: int = 6,
+                                 max_abs_bias: float = 3.0) -> pd.DataFrame:
+
+    b = fc_back.dropna(subset=["actual","yhat"]).copy()
+    if b.empty:
+        print("[POST] Bias correction skipped (no actual in backcast).")
+        return fc_fwd
+
+    b["err"] = b["actual"] - b["yhat"]
+    # rata2 error beberapa bulan terakhir
+    bias = b["err"].tail(win).mean()
+    # jangan lebay
+    bias = float(np.clip(bias, -max_abs_bias, max_abs_bias))
+
+    out = fc_fwd.copy()
+    out["date"] = pd.to_datetime(out["date"])
+
+    def _in_lebaran_window(ts: pd.Timestamp, month_window: int = 2) -> bool:
+        for d in LEBARAN_DATES:
+            diff = (ts.to_period("M") - d.to_period("M")).n
+            if abs(diff) <= month_window:
+                return True
+        return False
+
+    mask_adj = ~out["date"].apply(_in_lebaran_window)
+
+    out.loc[mask_adj, "yhat"] = out.loc[mask_adj, "yhat"] + bias
+    if "yhat_p10" in out:
+        out.loc[mask_adj, "yhat_p10"] = out.loc[mask_adj, "yhat_p10"] + bias
+    if "yhat_p90" in out:
+        out.loc[mask_adj, "yhat_p90"] = out.loc[mask_adj, "yhat_p90"] + bias
+
+    print(f"[POST] Bias correction (smart) applied: {bias:.2f} on {mask_adj.sum()} future points")
+    return out
+
+fcst_fwd = _apply_bias_correction_smart(fcst_back, fcst_fwd, win=BIAS_CORR_WINDOW)
+
+from lightgbm import LGBMRegressor
+def _apply_residual_corrector(fc_back: pd.DataFrame, fc_fwd: pd.DataFrame, aux: dict, selected_features: list):
+    # Guard: data cukup?
+    if not {'actual','yhat','date'}.issubset(fc_back.columns) or not {'yhat','date'}.issubset(fc_fwd.columns):
+        print("[RC] Skip: columns incomplete."); return fc_fwd
+
+    b = fc_back.dropna(subset=['actual','yhat']).copy()
+    if b.empty or len(b) < 12:
+        print("[RC] Skip: insufficient backcast history."); return fc_fwd
+
+    b['residual'] = b['actual'] - b['yhat']
+    win = min(24, len(b))
+    b = b.tail(win).copy()
+
+    df_scaled = aux.get('df_scaled', None)
+    raw_predictors = aux.get('raw_predictors', [])
+    base_time_cols = aux.get('base_time_cols', [])
+    if df_scaled is None:
+        print("[RC] Skip: aux['df_scaled'] missing."); return fc_fwd
+
+    def _row_feats(when: pd.Timestamp) -> pd.DataFrame:
+        return compute_single_row_features(df_scaled, when, CFG, raw_predictors, base_time_cols)
+
+    # Siapkan feature untuk histori residual
+    rows_hist = [ _row_feats(pd.Timestamp(d_)) for d_ in b['date'] ]
+    X_hist_full = pd.concat(rows_hist, ignore_index=True)
+
+    # Fit pakai feature set model mid
+    def _featnames_for_model(model) -> list:
+        try:
+            return list(model.booster_.feature_name())
+        except Exception:
+            try:
+                return list(getattr(model, "feature_names_in_", []))
+            except Exception:
+                return []
+
+    base_featnames = aux.get('feature_cols', selected_features[:])
+    feat_cols_rc = [c for c in base_featnames if c in X_hist_full.columns]
+    if len(feat_cols_rc) == 0:
+        print("[RC] Skip: no overlapping features for residual model."); return fc_fwd
+
+    X_hist = X_hist_full.reindex(columns=feat_cols_rc).copy().fillna(0.0)
+    y_hist = b['residual'].values
+
+    m_resid = LGBMRegressor(
+        n_estimators=500, learning_rate=0.05,
+        num_leaves=31, max_depth=8,
+        subsample=0.85, colsample_bytree=0.85,
+        reg_lambda=1.0, random_state=42, n_jobs=-1, verbosity=-1,
+    )
+    m_resid.fit(X_hist, y_hist)
+
+    # Prediksi adj untuk future
+    rows_future = [ _row_feats(pd.Timestamp(d_)) for d_ in fc_fwd['date'] ]
+    X_future_full = pd.concat(rows_future, ignore_index=True)
+    X_future = X_future_full.reindex(columns=feat_cols_rc).copy().fillna(0.0)
+
+    adj = np.asarray(m_resid.predict(X_future), dtype=float)
+    std_adj = float(np.nanstd(adj))
+    mean_adj = float(np.nanmean(adj))
+
+    # Guard 1: variance sangat kecil -> tidak informatif
+    if not np.isfinite(std_adj) or std_adj < 2.5:
+        print(f"[RC] Disabled (low variance adj; std={std_adj:.2f}).")
+        return fc_fwd
+
+    # Guard 2: fallback MOY (kita tidak pakai di versi ini; jika perlu, bisa tambahkan)
+    # Guard 3: clamp berdasarkan histori
+    res_std_hist = float(np.nanstd(b['residual'].values))
+    lim = 3.0 * (res_std_hist if np.isfinite(res_std_hist) and res_std_hist>0 else 1.0)
+    adj = np.clip(adj, -lim, +lim)
+
+    out = fc_fwd.copy()
+    out['yhat'] = out['yhat'] + adj
+    if 'yhat_p10' in out.columns: out['yhat_p10'] = out['yhat_p10'] + adj
+    if 'yhat_p90' in out.columns: out['yhat_p90'] = out['yhat_p90'] + adj
+
+    print(f"[RC] Applied. adj: mean={mean_adj:.2f}, std={std_adj:.2f}, hist_resid_std={res_std_hist:.2f}, clip=±{lim:.2f}")
+    return out
+
+fcst_fwd = _apply_residual_corrector(fcst_back, fcst_fwd, aux, selected_features)
+
+# === Conformalized Quantile (CQR) + QVAR (widen-only) — perbaikan #6
+def _calibrate_quantiles_cqr(fc_back: pd.DataFrame, fc_fwd: pd.DataFrame, window=CQR_WINDOW):
+    b = fc_back.dropna(subset=["actual","yhat"]).copy()
+    if len(b) < 8:
+        print("[CQR] Skip (too few backcast points).")
+        return fc_fwd
+    res = (b["actual"] - b["yhat"]).tail(window)
+    q10, q90 = np.quantile(res, [0.10, 0.90])
+    out = fc_fwd.copy()
+    lo = out["yhat"] + q10
+    hi = out["yhat"] + q90
+    out["yhat_p10"] = np.minimum(out["yhat"], np.maximum(0, lo))
+    out["yhat_p90"] = np.maximum(out["yhat"], np.maximum(0, hi))
+    print(f"[CQR] q10={q10:.2f}, q90={q90:.2f} | width={q90-q10:.2f}")
+    return out
+
+fcst_fwd = _calibrate_quantiles_cqr(fcst_back, fcst_fwd, window=CQR_WINDOW)
+
+def _apply_dynamic_quantile_variance(fc_back: pd.DataFrame, fc_fwd: pd.DataFrame):
+    if not {'actual','yhat'}.issubset(fc_back.columns):
+        print("[QVAR] Skip (no actual/yhat in backcast).")
+        return fc_fwd
+
+    b = fc_back.dropna(subset=['actual','yhat']).copy()
+    b['resid'] = b['actual'] - b['yhat']
+    b['vol'] = b['resid'].rolling(6, min_periods=3).std()
+    if b['vol'].dropna().empty:
+        print("[QVAR] Skip (no residual volatility).")
+        return fc_fwd
+
+    vol_mean = b['vol'].mean()
+    vol_future = np.interp(np.arange(len(fc_fwd)), [0, len(fc_fwd)-1], [b['vol'].iloc[-1], vol_mean])
+    # widen-only: jangan mengecilkan band hasil CQR
+    lo_prop = fc_fwd['yhat'] - 1.28 * vol_future
+    hi_prop = fc_fwd['yhat'] + 1.28 * vol_future
+    out = fc_fwd.copy()
+    out['yhat_p10'] = np.minimum(out['yhat_p10'], lo_prop)
+    out['yhat_p90'] = np.maximum(out['yhat_p90'], hi_prop)
+    print(f"[QVAR] Dynamic quantile variance applied (mean σ={vol_mean:.2f}).")
+    return out
+
+fcst_fwd = _apply_dynamic_quantile_variance(fcst_back, fcst_fwd)
+
+def _seasonal_naive_series(train: pd.Series, idx: pd.DatetimeIndex):
+    return train.shift(12).reindex(idx)
+
+def _blend_seasonal(fc_fwd: pd.DataFrame, df_all: pd.DataFrame, h0=BLEND_H0, hk=BLEND_HK):
+    if not DO_SEASONAL_BLEND:
+        return fc_fwd
+
+    hist = df_all.set_index("date")["Demand"]
+    idx = fc_fwd["date"]
+    s = _seasonal_naive_series(hist, idx)
+
+    out = fc_fwd.copy()
+    H = len(out)
+    ws = np.linspace(h0, hk, H)
+
+    # mask: hanya tarik yg di bawah seasonal
+    mask_under = out["yhat"].values < s.values
+
+    # blend untuk yang under
+    out.loc[mask_under, "yhat"] = (
+        (1 - ws[mask_under]) * out.loc[mask_under, "yhat"].values +
+        ws[mask_under] * s.values[mask_under]
+    )
+
+    if "yhat_p10" in out.columns:
+        # band tetap boleh condong ke seasonal, tapi aman-kan dari inversi
+        out.loc[mask_under, "yhat_p10"] = np.minimum(
+            out.loc[mask_under, "yhat_p10"].values,
+            out.loc[mask_under, "yhat"].values
+        )
+    if "yhat_p90" in out.columns:
+        out.loc[mask_under, "yhat_p90"] = np.maximum(
+            out.loc[mask_under, "yhat_p90"].values,
+            out.loc[mask_under, "yhat"].values
+        )
+
+    print(f"[POST] Seasonal blend applied on {mask_under.sum()}/{H} points (only where forecast < seasonal).")
+    return out
+
+fcst_fwd = _blend_seasonal(fcst_fwd, df, h0=BLEND_H0, hk=BLEND_HK)
+
+print("\nCheck forecast variation:")
+print(fcst_fwd[['yhat']].describe())
+
+# ---------- BASELINES & HORIZON-WISE METRICS ----------
+def _seasonal_naive(series: pd.Series, idx: pd.DatetimeIndex):
+    return series.shift(12).reindex(idx)
+
+def _drift_forecast(train_series: pd.Series, horizon_len: int):
+    y = train_series.dropna()
+    if len(y) < 2: return np.repeat(y.iloc[-1] if len(y) else np.nan, horizon_len)
+    y1, yT = y.iloc[0], y.iloc[-1]; nT = len(y)
+    return np.array([yT + i * (yT - y1) / max(nT-1,1) for i in range(1, horizon_len+1)])
+
+back_idx = fcst_back.loc[mask_eval_back, 'date']
+y_true_b = fcst_back.loc[mask_eval_back,'actual'].values
+yhat_b   = fcst_back.loc[mask_eval_back,'yhat'].values
+y_seas_b = _seasonal_naive(df.set_index('date')["Demand"], back_idx).values
+y_drift_b= _drift_forecast(df[(df['date']<backcast_start)]["Demand"], len(back_idx))
+
+def _hwise(y, yhat):
+    out=[]
+    for i in range(len(y)):
+        yy = np.array([y[i]]); pp = np.array([yhat[i]])
+        if np.isfinite(yy).all() and np.isfinite(pp).all():
+            mae = np.mean(np.abs(pp-yy)); rmse = np.sqrt(np.mean((pp-yy)**2)); mape = np.mean(np.abs((pp-yy)/np.clip(np.abs(yy),1e-9,None)))*100
+        else:
+            mae=rmse=mape=np.nan
+        out.append((i+1, mae, rmse, mape))
+    return pd.DataFrame(out, columns=["h","MAE","RMSE","MAPE%"])
+
+h_back_model = _hwise(y_true_b, yhat_b)
+h_back_seas  = _hwise(y_true_b, y_seas_b)
+h_back_drift = _hwise(y_true_b, y_drift_b)
+h_back = pd.concat([
+    h_back_model.assign(track="model"),
+    h_back_seas.assign(track="seasonal"),
+    h_back_drift.assign(track="drift")
+], ignore_index=True)
+
+for dfc in (fcst_back, fcst_fwd):
+    for c in ['yhat','yhat_p10','yhat_p90']:
+        if c in dfc.columns: dfc[c] = dfc[c].clip(lower=0)
+    if {'yhat_p10','yhat','yhat_p90'}.issubset(set(dfc.columns)):
+        tmp = dfc[['yhat_p10','yhat','yhat_p90']].values; tmp.sort(axis=1)
+        dfc[['yhat_p10','yhat','yhat_p90']] = tmp
+
+print("\n=== CV METRICS (Train, vintage-safe STL + GAP) ===")
+for i, fm in enumerate(cv_report['folds'], 1):
+    print(f"Fold {i}: MAE={fm.get('MAE',np.nan):.3f}, RMSE={fm.get('RMSE',np.nan):.3f}, MAPE%={fm.get('MAPE%',np.nan):.2f}")
+print("Avg:", {k: (round(v,3) if pd.notna(v) else v) for k,v in cv_report['avg'].items()})
+
+print("\n=== BACKCAST METRICS (Last 24 months; vintage-safe) ===")
+print({k: round(v,3) for k,v in back_metrics.items()})
+
+def _meanrow(df_):
+    return { "MAE": round(df_["MAE"].mean(),3), "RMSE": round(df_["RMSE"].mean(),3), "MAPE%": round(df_["MAPE%"].mean(),2)}
+print("\n[BASELINES] Backcast horizon-wise mean")
+print("Model   :", _meanrow(h_back[h_back.track=='model']))
+print("Seasonal:", _meanrow(h_back[h_back.track=='seasonal']))
+print("Drift   :", _meanrow(h_back[h_back.track=='drift']))
+
+print("\n[CHECK] Interactions present? =>",
+      [f for f in X_train.columns if f in (
+          'X_inter_libur_x_id_coal_t0',
+          'X_inter_libur_x_coal_nex6000_t0',
+          'X_inter_libur_x_usd_to_idr_t0',
+          'X_inter_libur_x_dxy_index_t0'
+      )])
+
+print("\nTop 20 Feature Importance (Predictors X_* only) — by gain")
+print(imp_x_sorted.head(20).to_string(index=False))
+
+print("\n=== INDICATOR INFLUENCE (Aggregated; predictors only) ===")
+print(agg_by_group.head(20).to_string(index=False))
+
+def _make_table(df_fcst: pd.DataFrame, segment: str) -> pd.DataFrame:
+    tbl = df_fcst.copy()
+    if 'actual' not in tbl.columns:
+        tbl['actual'] = np.nan
+    tbl['Date'] = pd.to_datetime(tbl['date'])
+    tbl['Periode'] = tbl['Date'].dt.strftime('%b-%y')
+    tbl = tbl.rename(columns={'yhat':'Forecast','yhat_p10':'Pessimistic(P10)','yhat_p90':'Optimistic(P90)','actual':'Actual'})
+    tbl = tbl[['Date','Periode','Forecast','Pessimistic(P10)','Optimistic(P90)','Actual']]
+    tbl['Segment'] = segment
+    cols = ['Segment','Date','Periode','Forecast','Pessimistic(P10)','Optimistic(P90)','Actual']
+    return tbl[cols]
+
+back_tbl = _make_table(fcst_back, "Backcast")
+fwd_tbl  = _make_table(fcst_fwd,  "Future")
+combined_tbl = pd.concat([back_tbl, fwd_tbl], ignore_index=True)
+combined_tbl.to_csv("forecast_all_combined.csv", index=False)
+with pd.ExcelWriter("model_outputs_combined.xlsx", engine="openpyxl") as writer:
+    combined_tbl.to_excel(writer, sheet_name="Forecast_All", index=False)
+    back_tbl.to_excel(writer, sheet_name="Backcast_24m", index=False)
+    fwd_tbl.to_excel(writer, sheet_name="Forecast_Future", index=False)
+    imp_x_sorted.to_excel(writer, sheet_name="FeatureImportance_X", index=False)
+    agg_by_group.to_excel(writer, sheet_name="IndicatorInfluence", index=False)
+    if ENABLE_SHAP and shap_per_fold is not None:
+        shap_per_fold.to_excel(writer, sheet_name="SHAP_Stability", index=False)
+    h_back.to_excel(writer, sheet_name="Horizon_Backcast", index=False)
+
+print("\nSaved files:\n- forecast_all_combined.csv\n- model_outputs_combined.xlsx")
+
+# ---------------- Regime shift 2025 detection ----------------
+Y = df[['date','Demand']].dropna().set_index('date')['Demand']
+roll_mean = Y.rolling(6, min_periods=6).mean()
+resid = (Y - roll_mean).dropna()
+cusum = resid.cumsum()
+shift_flag_2025 = False
+if len(cusum) > 12:
+    pre = cusum.loc[:'2024-12-31']
+    post = cusum.loc['2025-01-01':]
+    if not pre.empty and not post.empty:
+        shift_flag_2025 = (post.abs().mean() > (pre.abs().mean() + 2*pre.abs().std()))
+print("\n[REGIME] Possible regime shift around 2025:", shift_flag_2025)
+
+# PLOTS
+plt.figure(figsize=(13,5))
+plt.plot(df['date'], df["Demand"], label='Actual')
+plt.plot(fcst_back['date'], fcst_back['yhat'], linestyle='--', label='Forecast (backcast 24m)')
+if fcst_back['yhat_p10'].notna().any():
+    plt.fill_between(fcst_back['date'], fcst_back['yhat_p10'], fcst_back['yhat_p90'], alpha=0.15, label='80% PI (backcast)')
+plt.plot(fcst_fwd['date'], fcst_fwd['yhat'], linestyle='--', label='Forecast (future; vintage-safe)')
+plt.plot(fcst_fwd['date'], fcst_fwd['yhat_p90'], linestyle='-.', label='Optimistic (P90)')
+plt.plot(fcst_fwd['date'], fcst_fwd['yhat_p10'], linestyle='-.', label='Pessimistic (P10)')
+plt.title(f"Forecast Backcast 24m MAPE={back_metrics['MAPE%']:.2f}%")
+plt.legend(); plt.tight_layout(); plt.show(); plt.close()
+
+plt.figure(figsize=(10,6))
+topk = agg_by_group.head(20)
+plt.barh(topk['group'][::-1], topk['share_percent'][::-1])
+plt.title('Indicator Influence — Aggregated Gain Share by Predictor Group (WITHOUT Demand)')
+plt.xlabel('Gain Share (%)'); plt.tight_layout(); plt.show(); plt.close()
+
+print("\n=== Actual vs Forecast (Backcast 24m, ringkas 10 baris) ===")
+print(back_tbl.tail(10).to_string(index=False))
+print("\n=== Actual vs Forecast (Future, ringkas 10 baris) ===")
+print(fwd_tbl.head(10).to_string(index=False))
+
+# ======================= STRICT REAL-TIME =======================
+if STRICT_MODE:
+    _df_strict = _strict_apply_availability_lag(df, STRICT_AVAILABILITY_LAG_MAP)  # printed (format log tetap)
+    X_all_s, y_all_s, feat_s, aux_s = build_training_matrix(_df_strict, CFG, forecast_start)
+
+    if X_all_s.shape[1] == 0:
+        _orig_drop = CFG.drop_feat_missing_gt
+        _orig_near = CFG.drop_near_constant_thresh
+        for thr in (0.90, 0.95, 0.98, 1.00):
+            CFG.drop_feat_missing_gt = thr
+            X_all_s, y_all_s, feat_s, aux_s = build_training_matrix(_df_strict, CFG, forecast_start)
+            if X_all_s.shape[1] > 0:
+                print(f"[STRICT] Rebuilt features with drop_feat_missing_gt={thr:.2f} → {X_all_s.shape[1]} fitur")
+                break
+        CFG.drop_feat_missing_gt = _orig_drop
+        CFG.drop_near_constant_thresh = _orig_near
+
+    ds_s = aux_s['dates_all']; yd_s = aux_s['y_demand_all']
+    mask_s = (ds_s < forecast_start)
+    if CFG.rolling_train_months and CFG.rolling_train_months>0:
+        cutoff = forecast_start - pd.DateOffset(months=CFG.rolling_train_months)
+        mask_s = mask_s & (ds_s >= cutoff)
+    Xtr_s, ytr_s = X_all_s.loc[mask_s], y_all_s.loc[mask_s]
+    dates_tr_s = ds_s.loc[mask_s]; yd_tr_s = yd_s.loc[mask_s]
+
+    _max_lag_s, _max_roll_s, _has_t0_s = _infer_feature_memory_from_cols(list(X_all_s.columns))
+    _cv_gap_s = int(max(_max_lag_s, max(0, _max_roll_s-1)))
+    print(f"\n[STRICT] Suggested CV GAP (embargo) = {_cv_gap_s}  (max_lag={_max_lag_s}, max_roll={_max_roll_s}, has_t0={_has_t0_s})")
+
+    _cfg_s = _copy.deepcopy(CFG)
+    if Xtr_s.shape[0] < 60:
+        _cfg_s.n_splits = max(2, min(CFG.n_splits, max(2, Xtr_s.shape[0] // 12)))
+        print(f"[STRICT] n_splits dikurangi menjadi: {_cfg_s.n_splits} (train rows={Xtr_s.shape[0]})")
+
+    tr_s = aux_s.get('stl_trend', None); se_s = aux_s.get('stl_seasonal', None)
+    model_s, cv_s = train_lgbm_with_cv_gap(
+        Xtr_s, ytr_s, _cfg_s,
+        dates=dates_tr_s, y_orig=yd_tr_s, trend=tr_s, seasonal=se_s,
+        forecast_start=forecast_start, gap=_cv_gap_s,
+        test_size=12
+    )
+    model_p10_s = train_quantile_model(Xtr_s, ytr_s, dates_tr_s, forecast_start, alpha=0.10, cfg=_cfg_s)
+    model_p90_s = train_quantile_model(Xtr_s, ytr_s, dates_tr_s, forecast_start, alpha=0.90, cfg=_cfg_s)
+
+    fcst_back_s = forecast_path(_df_strict, model_s, model_p10_s, model_p90_s, _cfg_s,
+                                backcast_start, backcast_end, feat_s, aux=aux_s)
+    mask_eval_back_s = fcst_back_s['actual'].notna()
+    back_metrics_s = compute_metrics(fcst_back_s.loc[mask_eval_back_s,'actual'], fcst_back_s.loc[mask_eval_back_s,'yhat'])
+    if (FUTURE_MODE == "AR") and USE_TARGET_AS_FEATURE:
+        fcst_fwd_s = forecast_path_autoregressive(
+            _df_strict,
+            model_s, model_p10_s, model_p90_s,
+            _cfg_s,
+            forecast_start,
+            horizon=FORECAST_HORIZON,
+            lag_depth=LAG_DEPTH,
+            feature_cols=feat_s,
+            aux=aux_s
+        )
+    else:
+        fcst_fwd_s = forecast_path(
+            _df_strict,
+            model_s, model_p10_s, model_p90_s,
+            _cfg_s,
+            forecast_start,
+            forecast_end,
+            feat_s,
+            aux=aux_s
+        )
+
+    fcst_fwd_s = _apply_bias_correction_smart(fcst_back_s, fcst_fwd_s, win=BIAS_CORR_WINDOW)
+    fcst_fwd_s = _calibrate_quantiles_cqr(fcst_back_s, fcst_fwd_s, window=CQR_WINDOW)
+    fcst_fwd_s = _blend_seasonal(fcst_fwd_s, _df_strict, h0=BLEND_H0, hk=BLEND_HK)
+
+    for dfc in (fcst_back_s, fcst_fwd_s):
+        for c in ['yhat','yhat_p10','yhat_p90']:
+            if c in dfc.columns:
+                dfc[c] = dfc[c].clip(lower=0)
+        if {'yhat_p10','yhat','yhat_p90'}.issubset(set(dfc.columns)):
+            tmp = dfc[['yhat_p10','yhat','yhat_p90']].values
+            tmp.sort(axis=1)
+            dfc[['yhat_p10','yhat','yhat_p90']] = tmp
+
+    def _make_table_strict(df_fcst: pd.DataFrame, segment: str) -> pd.DataFrame:
+        tbl = df_fcst.copy()
+        tbl['Date'] = pd.to_datetime(tbl['date'])
+        tbl['Periode'] = tbl['Date'].dt.strftime('%b-%y')
+        tbl = tbl.rename(columns={'yhat':'Forecast','yhat_p10':'Pessimistic(P10)','yhat_p90':'Optimistic(P90)','actual':'Actual'})
+        tbl = tbl[['Date','Periode','Forecast','Pessimistic(P10)','Optimistic(P90)','Actual']]
+        tbl['Segment'] = segment
+        return tbl[['Segment','Date','Periode','Forecast','Pessimistic(P10)','Optimistic(P90)','Actual']]
+
+    back_tbl_s = _make_table_strict(fcst_back_s, "Backcast (STRICT)")
+    fwd_tbl_s  = _make_table_strict(fcst_fwd_s,  "Future (STRICT)")
+    combined_tbl_s = pd.concat([back_tbl_s, fwd_tbl_s], ignore_index=True)
+    try:
+        combined_tbl_s.to_csv("forecast_all_combined__strict.csv", index=False)
+        with pd.ExcelWriter("model_outputs_combined__strict.xlsx", engine="openpyxl") as writer:
+            combined_tbl_s.to_excel(writer, sheet_name="Forecast_All_STRICT", index=False)
+        print("Saved files (STRICT):\n- forecast_all_combined__strict.csv\n- model_outputs_combined__strict.xlsx")
+    except Exception as e:
+        print("[STRICT] Warning: couldn't write strict CSV/XLSX:", e)
+
+    print("\n=== REAL-TIME STRICT VALIDATION (vintage + embargo) ===")
+    for i, fm in enumerate(cv_s['folds'], 1):
+        print(f"[STRICT] Fold {i}: MAE={fm.get('MAE',np.nan):.3f}, RMSE={fm.get('RMSE',np.nan):.3f}, MAPE%={fm.get('MAPE%',np.nan):.2f}")
+    print("[STRICT] Avg:", {k: (round(v,3) if pd.notna(v) else v) for k,v in cv_s['avg'].items()}, f"| GAP={cv_s.get('gap',_cv_gap_s)}")
+    print("[STRICT] Backcast 24m:", {k: round(v,3) for k,v in back_metrics_s.items()})
+
+    print("\n=== Actual vs Forecast Strict (Backcast 24m, ringkas 10 baris) ===")
+    print(back_tbl_s.tail(10).to_string(index=False))
+    print("\n=== Actual vs Forecast Strict (Future, ringkas 10 baris) ===")
+    print(fwd_tbl_s.head(10).to_string(index=False))
+
+    if LEAKAGE_AUDIT_MODE:
+        print("[AUDIT] (placeholder) Audit tambahan dapat ditambahkan sesuai kebutuhan.")
+else:
+    print("[STRICT] Skipped (STRICT_MODE=False)")
+    if LEAKAGE_AUDIT_MODE:
+        print("[AUDIT] Jalan hanya pada dataset BASE (aktifkan STRICT_MODE=True untuk vintage test).")
+
+# === SAFE DIAGNOSTIC PRINTS ===
+try:
+    df_scaled = aux.get('df_scaled', pd.DataFrame()).copy()
+    cols_try = ['date', 'Demand', 'X_target_lag1', 'X_target_lag6', 'X_target_lag12']
+    cols_exist = [c for c in cols_try if c in df_scaled.columns]
+    if cols_exist:
+        print("\n[CHECK] Tail of df_scaled (available lag features):")
+        print(df_scaled.tail(20)[cols_exist])
+    else:
+        print("\n[INFO] None of the requested lag columns exist in df_scaled.")
+except Exception as e:
+    print(f"\n[WARN] Could not print df_scaled sample: {e}")
+
+try:
+    if 'imp_x_sorted' in locals() and not imp_x_sorted.empty:
+        print("\n[CHECK] Top 15 feature importance entries:")
+        print(imp_x_sorted.head(15))
+    else:
+        print("\n[INFO] imp_x_sorted not available or empty.")
+except Exception as e:
+    print(f"\n[WARN] Could not print feature importance: {e}")
+
+try:
+    if 'X_one' in locals() and isinstance(X_one, pd.DataFrame):
+        print("\n[CHECK] Last single-row feature input (X_one):")
+        print(X_one.tail(1).T)
+    else:
+        print("\n[INFO] X_one not defined or not a DataFrame.")
+except Exception as e:
+    print(f"\n[WARN] Could not print X_one: {e}")
+
+print("Type fcst_fwd:", type(fcst_fwd))
